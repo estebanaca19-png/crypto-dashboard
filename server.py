@@ -12,16 +12,18 @@ SECRET_KEY = os.environ.get("SECRET_KEY")
 @app.route("/precios")
 def precios():
     client = Client(API_KEY, SECRET_KEY, tld="com")
-    symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "DOGEUSDT"]
+    tickers = client.get_ticker()
     data = []
-    for s in symbols:
-        ticker = client.get_ticker(symbol=s)
-        data.append({
-            "symbol": s,
-            "name": s.replace("USDT", ""),
-            "price": float(ticker["lastPrice"]),
-            "change": float(ticker["priceChangePercent"])
-        })
+    for t in tickers:
+        if t["symbol"].endswith("USDT"):
+            data.append({
+                "symbol": t["symbol"],
+                "name": t["symbol"].replace("USDT", ""),
+                "price": float(t["lastPrice"]),
+                "change": float(t["priceChangePercent"]),
+                "volume": float(t["quoteVolume"])
+            })
+    data.sort(key=lambda x: x["volume"], reverse=True)
     return jsonify(data)
 
 @app.route("/balance")
@@ -29,10 +31,9 @@ def balance():
     try:
         client = Client(API_KEY, SECRET_KEY, tld="com")
         cuenta = client.get_account()
-        monedas = ["BTC", "ETH", "SOL", "DOGE"]
         data = []
         for b in cuenta["balances"]:
-            if b["asset"] in monedas:
+            if float(b["free"]) > 0 or float(b["locked"]) > 0:
                 data.append({
                     "asset": b["asset"],
                     "free": float(b["free"]),
