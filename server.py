@@ -1,4 +1,4 @@
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 from flask_cors import CORS
 from binance.client import Client
 import os
@@ -25,6 +25,29 @@ def precios():
             })
     data.sort(key=lambda x: x["volume"], reverse=True)
     return jsonify(data)
+
+@app.route("/historial/<symbol>")
+def historial(symbol):
+    try:
+        client = Client(API_KEY, SECRET_KEY, tld="com")
+        velas = client.get_klines(
+            symbol=symbol+"USDT",
+            interval=Client.KLINE_INTERVAL_4HOUR,
+            limit=24
+        )
+        data = []
+        for v in velas:
+            data.append({
+                "tiempo": v[0],
+                "open": float(v[1]),
+                "high": float(v[2]),
+                "low": float(v[3]),
+                "close": float(v[4]),
+                "volumen": float(v[5])
+            })
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/balance")
 def balance():
