@@ -2,11 +2,3 @@ flask
 flask-cors
 python-binance
 gunicorn
-EOFcat > Procfile << 'EOF'
-web: gunicorn server:app
-EOF1s
-cat > requirements.txt << 'EOF'
-flask
-flask-cors
-python-binance
-gunicorn
