@@ -9,10 +9,9 @@ CORS(app)
 API_KEY = os.environ.get("API_KEY")
 SECRET_KEY = os.environ.get("SECRET_KEY")
 
-client = Client(API_KEY, SECRET_KEY, tld="com")
-
 @app.route("/precios")
 def precios():
+    client = Client(API_KEY, SECRET_KEY, tld="com")
     symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "DOGEUSDT"]
     data = []
     for s in symbols:
@@ -27,6 +26,7 @@ def precios():
 
 @app.route("/balance")
 def balance():
+    client = Client(API_KEY, SECRET_KEY, tld="com")
     cuenta = client.get_account()
     monedas = ["BTC", "ETH", "SOL", "DOGE"]
     data = []
