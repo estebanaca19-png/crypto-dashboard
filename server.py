@@ -9,7 +9,7 @@ CORS(app)
 API_KEY = os.environ.get("API_KEY")
 SECRET_KEY = os.environ.get("SECRET_KEY")
 
-client = Client(API_KEY, SECRET_KEY)
+client = Client(API_KEY, SECRET_KEY, tld="com")
 
 @app.route("/precios")
 def precios():
