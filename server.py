@@ -29,42 +29,21 @@ def precios():
 @app.route("/historial/<symbol>")
 def historial(symbol):
     try:
+        from flask import request
         client = Client(API_KEY, SECRET_KEY, tld="com")
+        intervalo = request.args.get("interval", "4h")
+        limite = int(request.args.get("limit", 24))
+        intervalos = {
+            "1h": Client.KLINE_INTERVAL_1HOUR,
+            "4h": Client.KLINE_INTERVAL_4HOUR,
+            "1d": Client.KLINE_INTERVAL_1DAY,
+            "1w": Client.KLINE_INTERVAL_1WEEK
+        }
         velas = client.get_klines(
             symbol=symbol+"USDT",
-            interval=Client.KLINE_INTERVAL_4HOUR,
-            limit=24
+            interval=intervalos.get(intervalo, Client.KLINE_INTERVAL_4HOUR),
+            limit=limite
         )
-        data = []
-        for v in velas:
-            data.append({
-                "tiempo": v[0],
-                "open": float(v[1]),
-                "high": float(v[2]),
-                "low": float(v[3]),
-                "close": float(v[4]),
-                "volumen": float(v[5])
-            })
-        return jsonify(data)
+        return jsonify([{"tiempo":v[0],"open":float(v[1]),"high":float(v[2]),"low":float(v[3]),"close":float(v[4]),"volumen":float(v[5])} for v in velas])
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
-@app.route("/balance")
-def balance():
-    try:
-        client = Client(API_KEY, SECRET_KEY, tld="com")
-        cuenta = client.get_account()
-        data = []
-        for b in cuenta["balances"]:
-            if float(b["free"]) > 0 or float(b["locked"]) > 0:
-                data.append({
-                    "asset": b["asset"],
-                    "free": float(b["free"]),
-                    "locked": float(b["locked"])
-                })
-        return jsonify(data)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-if __name__ == "__main__":
-    app.run(debug=True)
