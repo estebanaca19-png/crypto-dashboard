@@ -26,18 +26,21 @@ def precios():
 
 @app.route("/balance")
 def balance():
-    client = Client(API_KEY, SECRET_KEY, tld="com")
-    cuenta = client.get_account()
-    monedas = ["BTC", "ETH", "SOL", "DOGE"]
-    data = []
-    for b in cuenta["balances"]:
-        if b["asset"] in monedas:
-            data.append({
-                "asset": b["asset"],
-                "free": float(b["free"]),
-                "locked": float(b["locked"])
-            })
-    return jsonify(data)
+    try:
+        client = Client(API_KEY, SECRET_KEY, tld="com")
+        cuenta = client.get_account()
+        monedas = ["BTC", "ETH", "SOL", "DOGE"]
+        data = []
+        for b in cuenta["balances"]:
+            if b["asset"] in monedas:
+                data.append({
+                    "asset": b["asset"],
+                    "free": float(b["free"]),
+                    "locked": float(b["locked"])
+                })
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
     app.run(debug=True)
