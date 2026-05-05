@@ -10,9 +10,8 @@ CORS(app)
 API_KEY = os.environ.get("API_KEY")
 SECRET_KEY = os.environ.get("SECRET_KEY")
 
-# CACHE
 cache = {}
-CACHE_TTL = 30  # segundos
+CACHE_TTL = 30
 
 def get_cache(key):
     if key in cache:
@@ -92,28 +91,52 @@ def resumen(symbol):
         max24h = float(ticker["highPrice"])
         min24h = float(ticker["lowPrice"])
         vol24h = float(ticker["quoteVolume"])
+
         ganancias, perdidas = 0, 0
         for i in range(1, len(cierres)):
             diff = cierres[i] - cierres[i-1]
             if diff > 0: ganancias += diff
             else: perdidas += abs(diff)
         rsi = 100 if perdidas == 0 else 100-(100/(1+(ganancias/len(cierres))/(perdidas/len(cierres))))
+
         mitad = len(cierres)//2
         tendencia = "alcista" if sum(cierres[mitad:])/len(cierres[mitad:]) > sum(cierres[:mitad])/mitad else "bajista"
         cambio4h = ((cierres[-1]-cierres[-2])/cierres[-2])*100
         vol_prom = sum(volumenes)/len(volumenes)
         vol_estado = "alto" if volumenes[-1]>vol_prom*1.2 else "bajo" if volumenes[-1]<vol_prom*0.8 else "normal"
+
         if rsi<35 and tendencia=="alcista": señal="COMPRAR"
         elif rsi>65 and tendencia=="bajista": señal="VENDER"
         elif rsi<40: señal="COMPRAR"
         elif rsi>60: señal="VENDER"
         else: señal="MANTENER"
+
+        # Probabilidad
+        prob_subida = 50
+        if tendencia == "alcista": prob_subida += 20
+        else: prob_subida -= 20
+        if rsi < 40: prob_subida += 15
+        elif rsi > 60: prob_subida -= 15
+        if cambio4h > 0: prob_subida += 10
+        else: prob_subida -= 10
+        if vol_estado == "alto": prob_subida += 5
+        prob_subida = max(5, min(95, prob_subida))
+        prob_bajada = 100 - prob_subida
+
         data = {
-            "symbol": symbol, "precio": precio,
-            "cambio24h": round(cambio24h,2), "cambio4h": round(cambio4h,2),
-            "max24h": max24h, "min24h": min24h, "vol24h": round(vol24h,0),
-            "rsi": round(rsi,1), "tendencia": tendencia,
-            "volumen_estado": vol_estado, "señal": señal,
+            "symbol": symbol,
+            "precio": precio,
+            "cambio24h": round(cambio24h, 2),
+            "cambio4h": round(cambio4h, 2),
+            "max24h": max24h,
+            "min24h": min24h,
+            "vol24h": round(vol24h, 0),
+            "rsi": round(rsi, 1),
+            "tendencia": tendencia,
+            "volumen_estado": vol_estado,
+            "señal": señal,
+            "prob_subida": round(prob_subida, 0),
+            "prob_bajada": round(prob_bajada, 0),
             "cierres": cierres[-8:]
         }
         set_cache(cache_key, data)
