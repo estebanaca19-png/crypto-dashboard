@@ -5,7 +5,7 @@ import os
 import time
 
 app = Flask(__name__)
-CORS(app)
+CORS(app, origins=["https://cruztrd.com", "https://cruztrd-dashboard.pages.dev", "https://candid-gumdrop-88288d.netlify.app"])
 
 API_KEY = os.environ.get("API_KEY")
 SECRET_KEY = os.environ.get("SECRET_KEY")
