@@ -1,17 +1,16 @@
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from binance.client import Client
-import os
-import time
+import os, time
 
 app = Flask(__name__)
-CORS(app, origins=["https://cruztrd.com", "https://cruztrd-dashboard.pages.dev", "https://candid-gumdrop-88288d.netlify.app"])
+CORS(app)
 
 API_KEY = os.environ.get("API_KEY")
 SECRET_KEY = os.environ.get("SECRET_KEY")
 
 cache = {}
-CACHE_TTL = 5  # 5 segundos para tiempo real
+CACHE_TTL = 5
 
 def get_cache(key):
     if key in cache:
@@ -35,14 +34,16 @@ def precios():
     tickers = client.get_ticker()
     data = []
     for t in tickers:
-        if t["symbol"].endswith("USDT"):
-            data.append({
-                "symbol": t["symbol"],
-                "name": t["symbol"].replace("USDT", ""),
-                "price": float(t["lastPrice"]),
-                "change": float(t["priceChangePercent"]),
-                "volume": float(t["quoteVolume"])
-            })
+        if t["symbol"].endswith("USDT") and float(t["quoteVolume"]) > 0:
+            name = t["symbol"].replace("USDT", "")
+            if name and name.isascii():
+                data.append({
+                    "symbol": t["symbol"],
+                    "name": name,
+                    "price": float(t["lastPrice"]),
+                    "change": float(t["priceChangePercent"]),
+                    "volume": float(t["quoteVolume"])
+                })
     data.sort(key=lambda x: x["volume"], reverse=True)
     set_cache("precios", data)
     return jsonify(data)
@@ -119,12 +120,12 @@ def resumen(symbol):
         prob_bajada = 100 - prob_subida
         data = {
             "symbol": symbol, "precio": precio,
-            "cambio24h": round(cambio24h, 2), "cambio4h": round(cambio4h, 2),
-            "max24h": max24h, "min24h": min24h, "vol24h": round(vol24h, 0),
-            "rsi": round(rsi, 1), "tendencia": tendencia,
+            "cambio24h": round(cambio24h,2), "cambio4h": round(cambio4h,2),
+            "max24h": max24h, "min24h": min24h, "vol24h": round(vol24h,0),
+            "rsi": round(rsi,1), "tendencia": tendencia,
             "volumen_estado": vol_estado, "señal": señal,
-            "prob_subida": round(prob_subida, 0),
-            "prob_bajada": round(prob_bajada, 0),
+            "prob_subida": round(prob_subida,0),
+            "prob_bajada": round(prob_bajada,0),
             "cierres": cierres[-8:]
         }
         set_cache(cache_key, data)
