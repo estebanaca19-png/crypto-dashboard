@@ -37,7 +37,7 @@ bot_state = {
     "profit_target": 0.8,   # % mínimo de ganancia para vender vs precio de compra
     "drop_to_buy": 0.15,    # % de caída en los últimos N segundos para comprar
     "trade_amount": 50,    # USDT por operación
-    "interval": 60,         # segundos entre ciclos
+    "interval": 20,         # segundos entre ciclos
     "positions": {},         # {symbol: {buy_price, qty, buy_time}}
     "log": [],
     "stats": {
