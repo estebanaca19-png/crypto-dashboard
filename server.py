@@ -200,15 +200,30 @@ def bot_cycle():
                 pnl_pct   = (price - buy_price) / buy_price
 
                 if pnl_pct >= profit_target:
+                    # Normalizar qty según LOT_SIZE de Binance antes de vender
+                    sell_qty = calc_qty(symbol, price, buy_price * qty)
+                    # Usar la qty guardada normalizada
+                    if symbol in ("DOGEUSDT", "ADAUSDT", "XRPUSDT"):
+                        sell_qty = int(qty)
+                    elif symbol in ("MATICUSDT",):
+                        sell_qty = round(qty, 1)
+                    elif symbol in ("LTCUSDT","BNBUSDT","SOLUSDT","AVAXUSDT","DOTUSDT","LINKUSDT"):
+                        sell_qty = round(qty, 2)
+                    elif symbol == "ETHUSDT":
+                        sell_qty = round(qty, 4)
+                    elif symbol == "BTCUSDT":
+                        sell_qty = round(qty, 5)
+                    else:
+                        sell_qty = round(qty, 2)
                     try:
                         order = client.create_order(
                             symbol=symbol,
                             side=SIDE_SELL,
                             type=ORDER_TYPE_MARKET,
-                            quantity=qty
+                            quantity=sell_qty
                         )
                         fill_price = float(order["fills"][0]["price"]) if order.get("fills") else price
-                        earned = (fill_price - buy_price) * qty
+                        earned = (fill_price - buy_price) * sell_qty
                         with bot_lock:
                             del bot_state["positions"][symbol]
                             bot_state["stats"]["total_pnl"] += earned
@@ -405,7 +420,7 @@ def set_position():
         }
     save_state()
     return jsonify({"ok": True, "msg": f"Posición {symbol} registrada @ ${buy_price}"})
-@app.route("/bot/portfolio")
+
 def bot_portfolio():
     """Retorna el portafolio real desde Binance con valor actual por moneda."""
     try:
