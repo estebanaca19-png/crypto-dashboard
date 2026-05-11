@@ -142,13 +142,15 @@ def round_step(qty, step):
     import math
     precision = int(round(-math.log10(step)))
     return round(math.floor(qty / step) * step, precision)
+
+def calc_qty(symbol, price, usdt_amount):
     """Calcula la cantidad a comprar según las reglas de LOT_SIZE de Binance."""
     qty = usdt_amount / price
     if symbol in ("DOGEUSDT", "ADAUSDT", "XRPUSDT"):
-        return round(qty, 0)   # enteros
+        return round(qty, 0)
     elif symbol in ("MATICUSDT",):
         return round(qty, 1)
-    elif symbol in ("LTCUSDT", "BNBUSDT", "SOLUSDT", "AVAXUSDT", "DOTUSDT", "LINKUSDT"):
+    elif symbol in ("LTCUSDT","BNBUSDT","SOLUSDT","AVAXUSDT","DOTUSDT","LINKUSDT"):
         return round(qty, 2)
     elif symbol in ("ETHUSDT",):
         return round(qty, 4)
