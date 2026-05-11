@@ -405,7 +405,7 @@ def set_position():
         }
     save_state()
     return jsonify({"ok": True, "msg": f"Posición {symbol} registrada @ ${buy_price}"})
-
+@app.route("/bot/portfolio")
 def bot_portfolio():
     """Retorna el portafolio real desde Binance con valor actual por moneda."""
     try:
