@@ -132,6 +132,7 @@ bot_state = {
 
 bot_thread = None
 bot_lock   = threading.Lock()
+state_lock = threading.Lock()  # lock ligero solo para modificar posiciones
 
 
 def bot_log(msg, level="info"):
@@ -769,7 +770,7 @@ def set_position():
     qty       = float(data.get("qty", 0))
     if not symbol or not buy_price or not qty:
         return jsonify({"ok": False, "msg": "Faltan datos"}), 400
-    acquired = bot_lock.acquire(timeout=5)
+    acquired = state_lock.acquire(timeout=5)
     if not acquired:
         return jsonify({"ok": False, "msg": "Bot ocupado, intenta de nuevo"}), 503
     try:
@@ -783,7 +784,7 @@ def set_position():
             "is_volatile":  False,
         }
     finally:
-        bot_lock.release()
+        state_lock.release()
     save_state()
     return jsonify({"ok": True, "msg": f"Posición {symbol} registrada @ ${buy_price}"})
 
@@ -795,14 +796,14 @@ def clear_position():
     symbol = data.get("symbol")
     if not symbol:
         return jsonify({"ok": False, "msg": "Falta symbol"}), 400
-    acquired = bot_lock.acquire(timeout=5)
+    acquired = state_lock.acquire(timeout=5)
     if not acquired:
         return jsonify({"ok": False, "msg": "Bot ocupado, intenta de nuevo"}), 503
     try:
         if symbol in bot_state["positions"]:
             del bot_state["positions"][symbol]
     finally:
-        bot_lock.release()
+        state_lock.release()
     save_state()
     return jsonify({"ok": True, "msg": f"Posición {symbol} eliminada"})
 
