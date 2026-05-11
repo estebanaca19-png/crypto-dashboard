@@ -48,6 +48,7 @@ bot_state = {
         "losses": 0,
     },
     "last_prices": {},
+    "last_changes": {},  # cambio 24h por par
 }
 
 bot_thread = None
@@ -88,7 +89,8 @@ def bot_cycle():
             change = float(ticker["priceChangePercent"]) / 100  # cambio 24h
 
             with bot_lock:
-                bot_state["last_prices"][symbol] = price
+                bot_state["last_prices"][symbol]  = price
+                bot_state["last_changes"][symbol] = float(ticker["priceChangePercent"])
                 position = bot_state["positions"].get(symbol)
 
             # ── Señal de COMPRA ─────────────────────────────────────────────
@@ -353,6 +355,7 @@ def bot_status():
             "positions":     bot_state["positions"],
             "stats":         bot_state["stats"],
             "last_prices":   bot_state["last_prices"],
+            "last_changes":  bot_state["last_changes"],
             "log":           bot_state["log"][-50:],
         })
 
