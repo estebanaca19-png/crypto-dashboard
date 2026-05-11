@@ -246,7 +246,7 @@ def bot_cycle():
                     elif symbol in ("LTCUSDT","BNBUSDT","SOLUSDT","AVAXUSDT","DOTUSDT","LINKUSDT"):
                         sell_qty = round(real_qty, 2)
                     elif symbol == "ETHUSDT":
-                        sell_qty = round(real_qty, 4)
+                        sell_qty = round(real_qty, 5)
                     elif symbol == "BTCUSDT":
                         sell_qty = round(real_qty, 5)
                     else:
