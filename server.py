@@ -34,8 +34,8 @@ def get_client():
 bot_state = {
     "running": False,
     "pairs": ["BTCUSDT","ETHUSDT","DOGEUSDT","SOLUSDT","BNBUSDT","XRPUSDT","ADAUSDT","AVAXUSDT","MATICUSDT","DOTUSDT","LINKUSDT","LTCUSDT"],
-    "profit_target": 1.0,   # % mínimo de ganancia para vender
-    "drop_to_buy": 1.5,     # % de caída para comprar
+    "profit_target": 0.8,   # % mínimo de ganancia para vender vs precio de compra
+    "drop_to_buy": 0.15,    # % de caída en los últimos N segundos para comprar
     "trade_amount": 60,    # USDT por operación
     "interval": 60,         # segundos entre ciclos
     "positions": {},         # {symbol: {buy_price, qty, buy_time}}
@@ -86,15 +86,20 @@ def bot_cycle():
         try:
             ticker = client.get_ticker(symbol=symbol)
             price  = float(ticker["lastPrice"])
-            change = float(ticker["priceChangePercent"]) / 100  # cambio 24h
 
             with bot_lock:
+                prev_price = bot_state["last_prices"].get(symbol)
+                # Cambio real respecto al ciclo anterior (últimos N segundos)
+                if prev_price:
+                    real_change = ((price - prev_price) / prev_price) * 100
+                else:
+                    real_change = 0.0
                 bot_state["last_prices"][symbol]  = price
-                bot_state["last_changes"][symbol] = float(ticker["priceChangePercent"])
+                bot_state["last_changes"][symbol] = real_change  # cambio vs ciclo anterior
                 position = bot_state["positions"].get(symbol)
 
-            # ── Señal de COMPRA ─────────────────────────────────────────────
-            if position is None and change <= -drop_to_buy:
+            # ── Señal de COMPRA: precio bajó ≥X% respecto al ciclo anterior ──
+            if position is None and prev_price and real_change <= -drop_to_buy:
                 qty = calc_qty(symbol, price, trade_amount)
                 try:
                     order = client.create_order(
@@ -112,11 +117,11 @@ def bot_cycle():
                             "order_id": order["orderId"],
                         }
                         bot_state["stats"]["trades"] += 1
-                    bot_log(f"▲ BUY  {symbol} @ ${fill_price:.4f} | qty: {qty} | cambio24h: {change*100:.2f}%", "buy")
+                    bot_log(f"▲ BUY  {symbol} @ ${fill_price:.4f} | qty: {qty} | caída: {real_change:.3f}%", "buy")
                 except Exception as e:
                     bot_log(f"✗ Error BUY {symbol}: {e}", "error")
 
-            # ── Señal de VENTA ──────────────────────────────────────────────
+            # ── Señal de VENTA: precio subió ≥X% respecto al precio de compra ─
             elif position is not None:
                 buy_price = position["buy_price"]
                 qty       = position["qty"]
