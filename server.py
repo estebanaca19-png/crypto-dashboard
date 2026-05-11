@@ -200,21 +200,31 @@ def bot_cycle():
                 pnl_pct   = (price - buy_price) / buy_price
 
                 if pnl_pct >= profit_target:
-                    # Normalizar qty según LOT_SIZE de Binance antes de vender
-                    sell_qty = calc_qty(symbol, price, buy_price * qty)
-                    # Usar la qty guardada normalizada
+                    # Obtener cantidad real disponible en Binance
+                    try:
+                        asset = symbol.replace("USDT", "")
+                        asset_balance = client.get_asset_balance(asset=asset)
+                        real_qty = float(asset_balance["free"])
+                    except:
+                        real_qty = qty
+
+                    # Normalizar según LOT_SIZE
                     if symbol in ("DOGEUSDT", "ADAUSDT", "XRPUSDT"):
-                        sell_qty = int(qty)
+                        sell_qty = int(real_qty)
                     elif symbol in ("MATICUSDT",):
-                        sell_qty = round(qty, 1)
+                        sell_qty = round(real_qty, 1)
                     elif symbol in ("LTCUSDT","BNBUSDT","SOLUSDT","AVAXUSDT","DOTUSDT","LINKUSDT"):
-                        sell_qty = round(qty, 2)
+                        sell_qty = round(real_qty, 2)
                     elif symbol == "ETHUSDT":
-                        sell_qty = round(qty, 4)
+                        sell_qty = round(real_qty, 4)
                     elif symbol == "BTCUSDT":
-                        sell_qty = round(qty, 5)
+                        sell_qty = round(real_qty, 5)
                     else:
-                        sell_qty = round(qty, 2)
+                        sell_qty = round(real_qty, 2)
+
+                    if sell_qty <= 0:
+                        bot_log(f"⚠ Sin balance para vender {symbol}", "info")
+                        continue
                     try:
                         order = client.create_order(
                             symbol=symbol,
