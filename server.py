@@ -125,7 +125,23 @@ def bot_log(msg, level="info"):
     logger.info(msg)
 
 
-def calc_qty(symbol, price, usdt_amount):
+def get_step_size(client, symbol):
+    """Obtiene el step size real de Binance para un símbolo."""
+    try:
+        info = client.get_symbol_info(symbol)
+        for f in info['filters']:
+            if f['filterType'] == 'LOT_SIZE':
+                step = float(f['stepSize'])
+                return step
+    except:
+        pass
+    return 0.001
+
+def round_step(qty, step):
+    """Redondea la cantidad al step size correcto."""
+    import math
+    precision = int(round(-math.log10(step)))
+    return round(math.floor(qty / step) * step, precision)
     """Calcula la cantidad a comprar según las reglas de LOT_SIZE de Binance."""
     qty = usdt_amount / price
     if symbol in ("DOGEUSDT", "ADAUSDT", "XRPUSDT"):
@@ -186,6 +202,9 @@ def bot_cycle():
                     bot_log(f"⚠ Sin USDT suficiente para {symbol} (disponible: ${usdt_free:.2f})", "info")
                     continue
                 qty = calc_qty(symbol, price, trade_amount)
+                # Ajustar al step size real de Binance
+                step = get_step_size(client, symbol)
+                qty = round_step(qty, step)
                 try:
                     order = client.create_order(
                         symbol=symbol,
@@ -238,19 +257,9 @@ def bot_cycle():
                     except:
                         real_qty = qty
 
-                    # Normalizar según LOT_SIZE
-                    if symbol in ("DOGEUSDT", "ADAUSDT", "XRPUSDT"):
-                        sell_qty = int(real_qty)
-                    elif symbol in ("MATICUSDT",):
-                        sell_qty = round(real_qty, 1)
-                    elif symbol in ("LTCUSDT","BNBUSDT","SOLUSDT","AVAXUSDT","DOTUSDT","LINKUSDT"):
-                        sell_qty = round(real_qty, 2)
-                    elif symbol == "ETHUSDT":
-                        sell_qty = round(real_qty, 5)
-                    elif symbol == "BTCUSDT":
-                        sell_qty = round(real_qty, 5)
-                    else:
-                        sell_qty = round(real_qty, 2)
+                    # Usar step size real de Binance
+                    step = get_step_size(client, symbol)
+                    sell_qty = round_step(real_qty, step)
 
                     if sell_qty <= 0:
                         bot_log(f"⚠ Sin balance para vender {symbol}", "info")
