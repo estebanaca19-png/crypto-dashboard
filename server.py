@@ -123,11 +123,21 @@ bot_state = {
     "vol_avg": {},
     "max_positions": 8,
     "stop_loss": 3.0,
-    "volatile_stop_loss": 2.0,  # stop-loss más ajustado para volátiles
-    # Blacklist: {symbol: timestamp_hasta_cuando_está_bloqueada}
+    "volatile_stop_loss": 2.0,
     "blacklist": {},
-    "blacklist_hours": 4,       # horas de bloqueo
-    "blacklist_threshold": 5.0, # % caída 24h para entrar en blacklist
+    "blacklist_hours": 4,
+    "blacklist_threshold": 5.0,
+    # ── DCA (Dollar Cost Averaging) ───────────────────────────────────────────
+    "dca_enabled": True,
+    "dca_levels": [
+        {"drop": 0.15, "amount_pct": 0.4},  # caída 0.15% → compra 40% del trade
+        {"drop": 0.30, "amount_pct": 0.35}, # caída 0.30% → compra 35% del trade
+        {"drop": 0.50, "amount_pct": 0.25}, # caída 0.50% → compra 25% del trade
+    ],
+    # ── Reinversión automática ────────────────────────────────────────────────
+    "reinvest_enabled": True,
+    "reinvest_pct": 80,  # reinvierte el 80% de cada ganancia, 20% queda como reserva
+    "total_reinvested": 0.0,
 }
 
 bot_thread = None
@@ -179,7 +189,40 @@ def calc_qty(symbol, price, usdt_amount):
         return round(qty, 2)
 
 
-def get_rsi(closes, period=14):
+def apply_reinvestment(earned):
+    """Reinvierte un porcentaje de la ganancia aumentando el capital por trade."""
+    if not bot_state.get("reinvest_enabled"):
+        return
+    reinvest_pct = bot_state.get("reinvest_pct", 80) / 100
+    reinvest_amt = earned * reinvest_pct
+    if reinvest_amt <= 0:
+        return
+    with bot_lock:
+        old_amount = bot_state["trade_amount"]
+        # Aumentar capital por trade gradualmente (máximo $200)
+        new_amount = min(old_amount + reinvest_amt, 200)
+        bot_state["trade_amount"]      = round(new_amount, 2)
+        bot_state["total_reinvested"]  = bot_state.get("total_reinvested", 0) + reinvest_amt
+    if new_amount > old_amount:
+        bot_log(f"♻ REINVERSIÓN +${reinvest_amt:.2f} → capital por trade: ${new_amount:.2f}", "buy")
+
+
+def get_dca_level(symbol, current_drop):
+    """Determina qué nivel DCA aplicar según la caída acumulada."""
+    pos = bot_state["positions"].get(symbol)
+    if not pos or not pos.get("dca_entries"):
+        return None
+    dca_levels  = bot_state.get("dca_levels", [])
+    dca_entries = pos.get("dca_entries", [])
+    n_entries   = len(dca_entries)
+    if n_entries >= len(dca_levels):
+        return None  # ya usó todos los niveles DCA
+    level = dca_levels[n_entries]
+    buy_price   = pos["buy_price"]
+    drop_from_buy = ((buy_price - current_drop) / buy_price) * 100
+    if drop_from_buy >= level["drop"]:
+        return level
+    return None
     """Calcula el RSI de una lista de precios de cierre."""
     if len(closes) < period + 1:
         return 50
@@ -276,6 +319,8 @@ def execute_sell(client, symbol, position, price, reason=""):
             else:
                 bot_state["stats"]["losses"] += 1
         save_state()
+        if earned > 0:
+            apply_reinvestment(earned)
         emoji = "▼" if reason == "profit" else "🛑"
         bot_log(f"{emoji} SELL {symbol} @ ${fill_price:.4f} | {'+' if earned>=0 else ''}${earned:.2f} | {pnl_pct*100:.2f}% [{reason}]",
                 "sell" if earned >= 0 else "error")
@@ -366,17 +411,19 @@ def bot_cycle():
             confirmed_drop = drops.get(symbol, 0) >= 2
 
             # ════════════════════════════════════════════════════════════════
-            # SEÑAL DE COMPRA
+            # SEÑAL DE COMPRA INICIAL (primera entrada DCA)
             # ════════════════════════════════════════════════════════════════
             if (position is None and
                 prev_price and
                 confirmed_drop and
                 rsi < (55 if high_vol else 50) and
                 n_positions < max_positions and
-                usdt_free >= t_amount and
+                usdt_free >= t_amount * 0.4 and  # solo necesita 40% del trade para primera entrada
                 not daily_goal_reached()):
 
-                qty  = calc_qty(symbol, price, t_amount)
+                # Primera entrada DCA: usa 40% del capital
+                first_amount = t_amount * 0.4
+                qty  = calc_qty(symbol, price, first_amount)
                 step = get_step_size(client, symbol)
                 qty  = round_step(qty, step)
                 try:
@@ -394,14 +441,59 @@ def bot_cycle():
                             "order_id":     order["orderId"],
                             "partial_sold": False,
                             "is_volatile":  is_volatile,
+                            "dca_entries":  [{"price": fill_price, "qty": qty, "cost": costo}],
+                            "avg_price":    fill_price,
                         }
                         bot_state["stats"]["trades"] += 1
                         bot_state["usdt_available"]  = usdt_free
                         drops[symbol] = 0
                     save_state()
-                    bot_log(f"▲ BUY [{tag}] {symbol} @ ${fill_price:.4f} | ${costo:.2f} | RSI:{rsi} | caída:{real_change:.3f}%", "buy")
+                    bot_log(f"▲ BUY [{tag}] {symbol} @ ${fill_price:.4f} | DCA 1/3 ${costo:.2f} | RSI:{rsi}", "buy")
                 except Exception as e:
                     bot_log(f"✗ Error BUY {symbol}: {e}", "error")
+
+            # ════════════════════════════════════════════════════════════════
+            # DCA: compras adicionales si el precio sigue bajando
+            # ════════════════════════════════════════════════════════════════
+            elif (position is not None and
+                  bot_state.get("dca_enabled") and
+                  not position.get("partial_sold")):
+
+                dca_levels  = bot_state.get("dca_levels", [])
+                dca_entries = position.get("dca_entries", [])
+                n_entries   = len(dca_entries)
+                avg_price   = position.get("avg_price", position["buy_price"])
+
+                if n_entries < len(dca_levels):
+                    level         = dca_levels[n_entries]
+                    drop_from_avg = ((avg_price - price) / avg_price) * 100
+                    dca_amount    = t_amount * level["amount_pct"]
+
+                    if drop_from_avg >= level["drop"] and usdt_free >= dca_amount:
+                        qty  = calc_qty(symbol, price, dca_amount)
+                        step = get_step_size(client, symbol)
+                        qty  = round_step(qty, step)
+                        try:
+                            order      = client.create_order(symbol=symbol, side=SIDE_BUY, type=ORDER_TYPE_MARKET, quantity=qty)
+                            fill_price = float(order["fills"][0]["price"]) if order.get("fills") else price
+                            costo      = fill_price * qty
+                            usdt_free -= costo
+                            # Recalcular precio promedio
+                            total_qty   = position["qty"] + qty
+                            total_cost  = position["cost"] + costo
+                            new_avg     = total_cost / total_qty
+                            with bot_lock:
+                                bot_state["positions"][symbol]["qty"]     = total_qty
+                                bot_state["positions"][symbol]["cost"]    = total_cost
+                                bot_state["positions"][symbol]["avg_price"] = new_avg
+                                bot_state["positions"][symbol]["dca_entries"].append(
+                                    {"price": fill_price, "qty": qty, "cost": costo}
+                                )
+                                bot_state["usdt_available"] = usdt_free
+                            save_state()
+                            bot_log(f"▲ DCA {n_entries+1}/{len(dca_levels)} {symbol} @ ${fill_price:.4f} | avg:${new_avg:.4f} | -{drop_from_avg:.2f}%", "buy")
+                        except Exception as e:
+                            bot_log(f"✗ Error DCA {symbol}: {e}", "error")
 
             # ════════════════════════════════════════════════════════════════
             # GESTIÓN DE POSICIÓN ABIERTA
@@ -921,6 +1013,9 @@ def bot_status():
             "stop_loss":          bot_state["stop_loss"],
             "volatile_stop_loss": bot_state["volatile_stop_loss"],
             "blacklist":          {k: round(v - time.time()) for k, v in bot_state["blacklist"].items() if v > time.time()},
+            "total_reinvested":   bot_state.get("total_reinvested", 0),
+            "dca_enabled":        bot_state.get("dca_enabled", True),
+            "reinvest_enabled":   bot_state.get("reinvest_enabled", True),
             "log":                bot_state["log"][-50:],
         })
 
