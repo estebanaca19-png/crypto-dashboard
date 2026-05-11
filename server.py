@@ -54,16 +54,6 @@ bot_state = {
 bot_thread = None
 bot_lock   = threading.Lock()
 
-# ─── Auto-arranque al cargar el módulo (compatible con gunicorn) ──────────────
-def _auto_start():
-    global bot_thread
-    bot_state["running"] = True
-    bot_thread = threading.Thread(target=bot_loop, daemon=True)
-    bot_thread.start()
-    logger.info("🚀 Bot arrancado automáticamente al iniciar el servidor.")
-
-_auto_start()
-
 
 def bot_log(msg, level="info"):
     entry = {"time": time.strftime("%H:%M:%S"), "msg": msg, "level": level}
@@ -386,6 +376,17 @@ def bot_config():
         "trade_amount":  bot_state["trade_amount"],
         "interval":      bot_state["interval"],
     }})
+
+
+# ─── Auto-arranque al cargar el módulo (compatible con gunicorn) ──────────────
+def _auto_start():
+    global bot_thread
+    bot_state["running"] = True
+    bot_thread = threading.Thread(target=bot_loop, daemon=True)
+    bot_thread.start()
+    logger.info("🚀 Bot arrancado automáticamente al iniciar el servidor.")
+
+_auto_start()
 
 
 if __name__ == "__main__":
