@@ -986,14 +986,20 @@ def bot_start():
     with bot_lock:
         if bot_state["running"]:
             return jsonify({"ok": False, "msg": "Bot ya está corriendo"}), 400
+        if "pairs"          in data: bot_state["pairs"]          = data["pairs"]
+        if "profit_target"  in data: bot_state["profit_target"]  = float(data["profit_target"])
+        if "drop_to_buy"    in data: bot_state["drop_to_buy"]    = float(data["drop_to_buy"])
+        if "trade_amount"   in data: bot_state["trade_amount"]   = float(data["trade_amount"])
+        if "interval"       in data: bot_state["interval"]       = int(data["interval"])
+        if "stop_loss"      in data: bot_state["stop_loss"]      = float(data["stop_loss"])
+        if "max_positions"  in data: bot_state["max_positions"]  = int(data["max_positions"])
+        if "reinvest_pct"   in data: bot_state["reinvest_pct"]   = int(data["reinvest_pct"])
+        bot_state["running"] = True
 
-        # Actualizar configuración si se envió
-        if "pairs"         in data: bot_state["pairs"]         = data["pairs"]
-        if "profit_target" in data: bot_state["profit_target"] = float(data["profit_target"])
-        if "drop_to_buy"   in data: bot_state["drop_to_buy"]   = float(data["drop_to_buy"])
-        if "trade_amount"  in data: bot_state["trade_amount"]  = float(data["trade_amount"])
-        if "interval"      in data: bot_state["interval"]      = int(data["interval"])
-
+    # Asegurarse que el hilo anterior terminó
+    if bot_thread and bot_thread.is_alive():
+        bot_state["running"] = False
+        bot_thread.join(timeout=5)
         bot_state["running"] = True
 
     bot_thread = threading.Thread(target=bot_loop, daemon=True)
@@ -1064,9 +1070,12 @@ def bot_config():
 # ─── Auto-arranque al cargar el módulo (compatible con gunicorn) ──────────────
 def _auto_start():
     global bot_thread
-    init_db()       # inicializar tabla en PostgreSQL
-    load_state()    # restaurar posiciones y stats desde DB
-    bot_state["running"] = True
+    init_db()
+    load_state()
+    with bot_lock:
+        if bot_state["running"]:
+            return  # ya hay una instancia corriendo
+        bot_state["running"] = True
     bot_thread = threading.Thread(target=bot_loop, daemon=True)
     bot_thread.start()
     logger.info("🚀 Bot arrancado automáticamente al iniciar el servidor.")
