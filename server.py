@@ -2,13 +2,43 @@ from flask import Flask, jsonify, request
 from flask_cors import CORS
 from binance.client import Client
 from binance.enums import SIDE_BUY, SIDE_SELL, ORDER_TYPE_MARKET
-import os, time, threading, logging
+import os, time, threading, logging, json
 
 app = Flask(__name__)
 CORS(app)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
+
+API_KEY    = os.environ.get("API_KEY")
+SECRET_KEY = os.environ.get("SECRET_KEY")
+
+# ─── Persistencia ─────────────────────────────────────────────────────────────
+STATE_FILE = "/app/bot_state_saved.json"
+
+def save_state():
+    """Guarda posiciones y stats en disco para sobrevivir reinicios."""
+    try:
+        data = {
+            "positions": bot_state["positions"],
+            "stats":     bot_state["stats"],
+        }
+        with open(STATE_FILE, "w") as f:
+            json.dump(data, f)
+    except Exception as e:
+        logger.error(f"Error guardando estado: {e}")
+
+def load_state():
+    """Carga posiciones y stats desde disco al arrancar."""
+    try:
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE, "r") as f:
+                data = json.load(f)
+            bot_state["positions"] = data.get("positions", {})
+            bot_state["stats"]     = data.get("stats", bot_state["stats"])
+            logger.info(f"✓ Estado restaurado: {len(bot_state['positions'])} posiciones cargadas.")
+    except Exception as e:
+        logger.error(f"Error cargando estado: {e}")
 
 API_KEY    = os.environ.get("API_KEY")
 SECRET_KEY = os.environ.get("SECRET_KEY")
@@ -146,6 +176,7 @@ def bot_cycle():
                         }
                         bot_state["stats"]["trades"] += 1
                         bot_state["usdt_available"] = usdt_free
+                    save_state()
                     bot_log(f"▲ BUY  {symbol} @ ${fill_price:.4f} | qty: {qty} | costo: ${costo:.2f} | caída: {real_change:.3f}%", "buy")
                 except Exception as e:
                     bot_log(f"✗ Error BUY {symbol}: {e}", "error")
@@ -187,6 +218,7 @@ def bot_cycle():
                             else:
                                 bot_state["stats"]["losses"] += 1
                         bot_log(f"▼ SELL {symbol} @ ${fill_price:.4f} | +${earned:.2f} USDT | {pnl_pct*100:.2f}%", "sell")
+                        save_state()
                     except Exception as e:
                         bot_log(f"✗ Error SELL {symbol}: {e}", "error")
                 else:
@@ -478,6 +510,7 @@ def bot_config():
 # ─── Auto-arranque al cargar el módulo (compatible con gunicorn) ──────────────
 def _auto_start():
     global bot_thread
+    load_state()  # restaurar posiciones y stats desde disco
     bot_state["running"] = True
     bot_thread = threading.Thread(target=bot_loop, daemon=True)
     bot_thread.start()
