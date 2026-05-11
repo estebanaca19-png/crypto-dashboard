@@ -33,10 +33,10 @@ def get_client():
 # ─── Bot state ────────────────────────────────────────────────────────────────
 bot_state = {
     "running": False,
-    "pairs": ["BTCUSDT", "ETHUSDT", "DOGEUSDT"],
+    "pairs": ["BTCUSDT","ETHUSDT","DOGEUSDT","SOLUSDT","BNBUSDT","XRPUSDT","ADAUSDT","AVAXUSDT","MATICUSDT","DOTUSDT","LINKUSDT","LTCUSDT"],
     "profit_target": 1.0,   # % mínimo de ganancia para vender
     "drop_to_buy": 1.5,     # % de caída para comprar
-    "trade_amount": 100,    # USDT por operación
+    "trade_amount": 60,    # USDT por operación
     "interval": 60,         # segundos entre ciclos
     "positions": {},         # {symbol: {buy_price, qty, buy_time}}
     "log": [],
@@ -66,12 +66,12 @@ def bot_log(msg, level="info"):
 
 def calc_qty(symbol, price, usdt_amount):
     """Calcula la cantidad a comprar según el símbolo."""
-    if symbol == "DOGEUSDT":
+    if symbol in ("DOGEUSDT","ADAUSDT","MATICUSDT","XRPUSDT"):
         return round(usdt_amount / price, 0)
-    elif symbol == "ETHUSDT":
+    elif symbol in ("BTCUSDT","ETHUSDT","SOLUSDT","AVAXUSDT","DOTUSDT","LINKUSDT","LTCUSDT","BNBUSDT"):
         return round(usdt_amount / price, 4)
     else:
-        return round(usdt_amount / price, 5)
+        return round(usdt_amount / price, 4)
 
 
 def bot_cycle():
