@@ -386,7 +386,26 @@ def mi_ip():
     return jsonify(r.json())
 
 
-@app.route("/bot/portfolio")
+@app.route("/bot/set_position", methods=["POST"])
+def set_position():
+    """Registra manualmente una posición con precio de compra conocido."""
+    data = request.get_json(silent=True) or {}
+    symbol    = data.get("symbol")
+    buy_price = float(data.get("buy_price", 0))
+    qty       = float(data.get("qty", 0))
+    if not symbol or not buy_price or not qty:
+        return jsonify({"ok": False, "msg": "Faltan datos"}), 400
+    with bot_lock:
+        bot_state["positions"][symbol] = {
+            "buy_price": buy_price,
+            "qty":       qty,
+            "cost":      round(buy_price * qty, 2),
+            "buy_time":  time.time(),
+            "order_id":  "manual",
+        }
+    save_state()
+    return jsonify({"ok": True, "msg": f"Posición {symbol} registrada @ ${buy_price}"})
+
 def bot_portfolio():
     """Retorna el portafolio real desde Binance con valor actual por moneda."""
     try:
