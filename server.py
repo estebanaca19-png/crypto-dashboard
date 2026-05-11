@@ -206,9 +206,10 @@ def check_daily_reset():
     """Resetea el P&L diario si es un nuevo día."""
     today = time.strftime("%Y-%m-%d")
     with bot_lock:
-        if bot_state["stats"]["last_reset"] != today:
-            bot_state["stats"]["daily_pnl"] = 0.0
-            bot_state["stats"]["last_reset"] = today
+        if bot_state["stats"].get("last_reset", "") != today:
+            bot_state["stats"]["daily_pnl"]   = 0.0
+            bot_state["stats"]["last_reset"]  = today
+            bot_state["stats"]["daily_goal"]  = bot_state["stats"].get("daily_goal", 5.0)
             bot_log("📅 Nuevo día — P&L diario reseteado", "info")
 
 def daily_goal_reached():
