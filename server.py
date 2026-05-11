@@ -93,12 +93,17 @@ def get_client():
 # ─── Bot state ────────────────────────────────────────────────────────────────
 bot_state = {
     "running": False,
+    # Pares estables
     "pairs": ["BTCUSDT","ETHUSDT","DOGEUSDT","SOLUSDT","BNBUSDT","XRPUSDT","ADAUSDT","AVAXUSDT","MATICUSDT","DOTUSDT","LINKUSDT","LTCUSDT"],
-    "profit_target": 0.8,   # % mínimo de ganancia para vender vs precio de compra
-    "drop_to_buy": 0.15,    # % de caída en los últimos N segundos para comprar
-    "trade_amount": 50,    # USDT por operación
-    "interval": 20,         # segundos entre ciclos
-    "positions": {},         # {symbol: {buy_price, qty, buy_time}}
+    # Pares volátiles (monedas meme/alta volatilidad)
+    "volatile_pairs": ["SHIBUSDT","PEPEUSDT","WIFUSDT","BONKUSDT","FLOKIUSDT"],
+    "profit_target": 0.8,       # % ganancia para vender (pares estables)
+    "volatile_profit": 1.5,     # % ganancia para vender (pares volátiles)
+    "drop_to_buy": 0.15,        # % caída para comprar
+    "trade_amount": 50,         # USDT por operación (estables)
+    "volatile_amount": 20,      # USDT por operación (volátiles)
+    "interval": 20,
+    "positions": {},
     "log": [],
     "stats": {
         "trades": 0,
@@ -106,6 +111,9 @@ bot_state = {
         "cycles": 0,
         "wins": 0,
         "losses": 0,
+        "daily_pnl": 0.0,
+        "daily_goal": 5.0,      # meta diaria en USDT
+        "last_reset": time.strftime("%Y-%m-%d"),
     },
     "last_prices": {},
     "last_changes": {},
@@ -115,6 +123,11 @@ bot_state = {
     "vol_avg": {},
     "max_positions": 8,
     "stop_loss": 3.0,
+    "volatile_stop_loss": 2.0,  # stop-loss más ajustado para volátiles
+    # Blacklist: {symbol: timestamp_hasta_cuando_está_bloqueada}
+    "blacklist": {},
+    "blacklist_hours": 4,       # horas de bloqueo
+    "blacklist_threshold": 5.0, # % caída 24h para entrar en blacklist
 }
 
 bot_thread = None
@@ -173,7 +186,34 @@ def bot_cycle():
         drop_to_buy   = bot_state["drop_to_buy"] / 100
         trade_amount  = bot_state["trade_amount"]
 
-def get_rsi(closes, period=14):
+def is_blacklisted(symbol):
+    """Verifica si un símbolo está en blacklist."""
+    blacklist = bot_state.get("blacklist", {})
+    if symbol in blacklist:
+        if time.time() < blacklist[symbol]:
+            return True
+        else:
+            del bot_state["blacklist"][symbol]
+    return False
+
+def add_to_blacklist(symbol, hours=4):
+    """Agrega un símbolo a la blacklist por N horas."""
+    with bot_lock:
+        bot_state["blacklist"][symbol] = time.time() + (hours * 3600)
+    bot_log(f"🚫 BLACKLIST {symbol} por {hours}h — tendencia bajista detectada", "error")
+
+def check_daily_reset():
+    """Resetea el P&L diario si es un nuevo día."""
+    today = time.strftime("%Y-%m-%d")
+    with bot_lock:
+        if bot_state["stats"]["last_reset"] != today:
+            bot_state["stats"]["daily_pnl"] = 0.0
+            bot_state["stats"]["last_reset"] = today
+            bot_log("📅 Nuevo día — P&L diario reseteado", "info")
+
+def daily_goal_reached():
+    """Verifica si se alcanzó la meta diaria."""
+    return bot_state["stats"]["daily_pnl"] >= bot_state["stats"]["daily_goal"]
     """Calcula el RSI de una lista de precios de cierre."""
     if len(closes) < period + 1:
         return 50
@@ -237,13 +277,185 @@ def execute_sell(client, symbol, position, price, reason=""):
 
 def bot_cycle():
     client = get_client()
+
+    # Reset diario
+    check_daily_reset()
+
     with bot_lock:
-        pairs         = list(bot_state["pairs"])
-        profit_target = bot_state["profit_target"] / 100
-        drop_to_buy   = bot_state["drop_to_buy"] / 100
-        trade_amount  = bot_state["trade_amount"]
-        max_positions = bot_state.get("max_positions", 8)
-        stop_loss     = bot_state.get("stop_loss", 3.0) / 100
+        pairs              = list(bot_state["pairs"])
+        volatile_pairs     = list(bot_state["volatile_pairs"])
+        profit_target      = bot_state["profit_target"] / 100
+        volatile_profit    = bot_state["volatile_profit"] / 100
+        drop_to_buy        = bot_state["drop_to_buy"] / 100
+        trade_amount       = bot_state["trade_amount"]
+        volatile_amount    = bot_state["volatile_amount"]
+        max_positions      = bot_state.get("max_positions", 8)
+        stop_loss          = bot_state.get("stop_loss", 3.0) / 100
+        volatile_stop_loss = bot_state.get("volatile_stop_loss", 2.0) / 100
+        blacklist_threshold = bot_state.get("blacklist_threshold", 5.0)
+        blacklist_hours    = bot_state.get("blacklist_hours", 4)
+        all_pairs          = pairs + [p for p in volatile_pairs if p not in pairs]
+
+    # Balance USDT
+    try:
+        account   = client.get_account()
+        usdt_free = next((float(b["free"]) for b in account["balances"] if b["asset"] == "USDT"), 0.0)
+        with bot_lock:
+            bot_state["usdt_available"] = usdt_free
+    except Exception as e:
+        bot_log(f"✗ Error obteniendo balance: {e}", "error")
+        usdt_free = 0.0
+
+    high_vol = is_high_volatility_hour()
+
+    for symbol in all_pairs:
+        try:
+            is_volatile = symbol in volatile_pairs
+            p_target    = volatile_profit if is_volatile else profit_target
+            sl          = volatile_stop_loss if is_volatile else stop_loss
+            t_amount    = volatile_amount if is_volatile else trade_amount
+
+            ticker   = client.get_ticker(symbol=symbol)
+            price    = float(ticker["lastPrice"])
+            vol24h   = float(ticker["quoteVolume"])
+            chg24h   = float(ticker["priceChangePercent"])
+
+            # ── Blacklist automática por caída fuerte en 24h ──────────────────
+            if chg24h <= -blacklist_threshold and symbol not in bot_state["positions"]:
+                if not is_blacklisted(symbol):
+                    add_to_blacklist(symbol, blacklist_hours)
+                continue
+
+            # ── Saltar si está en blacklist ───────────────────────────────────
+            if is_blacklisted(symbol):
+                continue
+
+            with bot_lock:
+                history     = bot_state["price_history"].get(symbol, [])
+                history.append(price)
+                if len(history) > 20:
+                    history = history[-20:]
+                bot_state["price_history"][symbol] = history
+                prev_price  = bot_state["last_prices"].get(symbol)
+                real_change = ((price - prev_price) / prev_price * 100) if prev_price else 0.0
+                bot_state["last_prices"][symbol]  = price
+                bot_state["last_changes"][symbol] = real_change
+                position    = bot_state["positions"].get(symbol)
+                n_positions = len(bot_state["positions"])
+
+            rsi = get_rsi(history) if len(history) >= 5 else 50
+
+            # Confirmación caída consecutiva
+            drops = bot_state.get("consecutive_drops", {})
+            if real_change <= -drop_to_buy:
+                drops[symbol] = drops.get(symbol, 0) + 1
+            else:
+                drops[symbol] = 0
+            with bot_lock:
+                bot_state["consecutive_drops"] = drops
+            confirmed_drop = drops.get(symbol, 0) >= 2
+
+            # ════════════════════════════════════════════════════════════════
+            # SEÑAL DE COMPRA
+            # ════════════════════════════════════════════════════════════════
+            if (position is None and
+                prev_price and
+                confirmed_drop and
+                rsi < (55 if high_vol else 50) and
+                n_positions < max_positions and
+                usdt_free >= t_amount and
+                not daily_goal_reached()):
+
+                qty  = calc_qty(symbol, price, t_amount)
+                step = get_step_size(client, symbol)
+                qty  = round_step(qty, step)
+                try:
+                    order      = client.create_order(symbol=symbol, side=SIDE_BUY, type=ORDER_TYPE_MARKET, quantity=qty)
+                    fill_price = float(order["fills"][0]["price"]) if order.get("fills") else price
+                    costo      = fill_price * qty
+                    usdt_free -= costo
+                    tag        = "🔥VOLATILE" if is_volatile else "estable"
+                    with bot_lock:
+                        bot_state["positions"][symbol] = {
+                            "buy_price":    fill_price,
+                            "qty":          qty,
+                            "cost":         costo,
+                            "buy_time":     time.time(),
+                            "order_id":     order["orderId"],
+                            "partial_sold": False,
+                            "is_volatile":  is_volatile,
+                        }
+                        bot_state["stats"]["trades"] += 1
+                        bot_state["usdt_available"]  = usdt_free
+                        drops[symbol] = 0
+                    save_state()
+                    bot_log(f"▲ BUY [{tag}] {symbol} @ ${fill_price:.4f} | ${costo:.2f} | RSI:{rsi} | caída:{real_change:.3f}%", "buy")
+                except Exception as e:
+                    bot_log(f"✗ Error BUY {symbol}: {e}", "error")
+
+            # ════════════════════════════════════════════════════════════════
+            # GESTIÓN DE POSICIÓN ABIERTA
+            # ════════════════════════════════════════════════════════════════
+            elif position is not None:
+                buy_price   = position["buy_price"]
+                qty         = position["qty"]
+                pnl_pct     = (price - buy_price) / buy_price
+                pos_volatile = position.get("is_volatile", False)
+                p_target    = volatile_profit if pos_volatile else profit_target
+                sl          = volatile_stop_loss if pos_volatile else stop_loss
+
+                # 🛑 STOP-LOSS
+                if pnl_pct <= -sl:
+                    bot_log(f"🛑 STOP-LOSS {symbol} @ ${price:.4f} | {pnl_pct*100:.2f}%", "error")
+                    if execute_sell(client, symbol, position, price, reason="stop-loss"):
+                        add_to_blacklist(symbol, blacklist_hours * 2)  # doble blacklist tras stop-loss
+                        with bot_lock:
+                            bot_state["stats"]["daily_pnl"] += (price - buy_price) * qty
+
+                # ✅ VENTA PARCIAL al llegar a profit_target
+                elif pnl_pct >= p_target and not position.get("partial_sold"):
+                    try:
+                        asset    = symbol.replace("USDT", "")
+                        real_qty = float(client.get_asset_balance(asset=asset)["free"])
+                        step     = get_step_size(client, symbol)
+                        half_qty = round_step(real_qty * 0.5, step)
+                        if half_qty > 0:
+                            order      = client.create_order(symbol=symbol, side=SIDE_SELL, type=ORDER_TYPE_MARKET, quantity=half_qty)
+                            fill_price = float(order["fills"][0]["price"]) if order.get("fills") else price
+                            earned     = (fill_price - buy_price) * half_qty
+                            with bot_lock:
+                                bot_state["positions"][symbol]["partial_sold"] = True
+                                bot_state["positions"][symbol]["qty"]          = real_qty - half_qty
+                                bot_state["stats"]["total_pnl"]  += earned
+                                bot_state["stats"]["daily_pnl"]  += earned
+                                bot_state["stats"]["trades"]     += 1
+                                bot_state["stats"]["wins"]       += 1
+                            save_state()
+                            bot_log(f"½ SELL 50% {symbol} @ ${fill_price:.4f} | +${earned:.2f} | meta día: ${bot_state['stats']['daily_pnl']:.2f}/${bot_state['stats']['daily_goal']:.2f}", "sell")
+                    except Exception as e:
+                        bot_log(f"✗ Error venta parcial {symbol}: {e}", "error")
+
+                # ✅ VENTA TOTAL al llegar a profit_target*2
+                elif pnl_pct >= p_target * 2 and position.get("partial_sold"):
+                    if execute_sell(client, symbol, position, price, reason="profit"):
+                        earned = (price - buy_price) * qty
+                        with bot_lock:
+                            bot_state["stats"]["daily_pnl"] += earned
+                        if daily_goal_reached():
+                            bot_log(f"🎯 META DIARIA ALCANZADA: ${bot_state['stats']['daily_pnl']:.2f} — el bot seguirá vendiendo pero pausará nuevas compras", "buy")
+
+                else:
+                    goal     = bot_state["stats"]["daily_goal"]
+                    daily    = bot_state["stats"]["daily_pnl"]
+                    sl_dist  = (pnl_pct + sl) / sl * 100
+                    tag      = "🔥" if pos_volatile else "◷"
+                    bot_log(f"{tag} HOLD {symbol} @ ${price:.4f} | P&L:{pnl_pct*100:.2f}% | RSI:{rsi} | SL:{sl_dist:.0f}% | día:${daily:.2f}/${goal:.2f}", "info")
+
+        except Exception as e:
+            bot_log(f"✗ Error ciclo {symbol}: {e}", "error")
+
+    with bot_lock:
+        bot_state["stats"]["cycles"] += 1
 
     # ── Balance USDT disponible ───────────────────────────────────────────────
     try:
@@ -669,18 +881,25 @@ def bot_stop():
 def bot_status():
     with bot_lock:
         return jsonify({
-            "running":       bot_state["running"],
-            "pairs":         bot_state["pairs"],
-            "profit_target": bot_state["profit_target"],
-            "drop_to_buy":   bot_state["drop_to_buy"],
-            "trade_amount":  bot_state["trade_amount"],
-            "interval":      bot_state["interval"],
-            "positions":     bot_state["positions"],
-            "stats":         bot_state["stats"],
-            "last_prices":   bot_state["last_prices"],
-            "last_changes":  bot_state["last_changes"],
-            "usdt_available": bot_state["usdt_available"],
-            "log":           bot_state["log"][-50:],
+            "running":            bot_state["running"],
+            "pairs":              bot_state["pairs"],
+            "volatile_pairs":     bot_state["volatile_pairs"],
+            "profit_target":      bot_state["profit_target"],
+            "volatile_profit":    bot_state["volatile_profit"],
+            "drop_to_buy":        bot_state["drop_to_buy"],
+            "trade_amount":       bot_state["trade_amount"],
+            "volatile_amount":    bot_state["volatile_amount"],
+            "interval":           bot_state["interval"],
+            "positions":          bot_state["positions"],
+            "stats":              bot_state["stats"],
+            "last_prices":        bot_state["last_prices"],
+            "last_changes":       bot_state["last_changes"],
+            "usdt_available":     bot_state["usdt_available"],
+            "max_positions":      bot_state["max_positions"],
+            "stop_loss":          bot_state["stop_loss"],
+            "volatile_stop_loss": bot_state["volatile_stop_loss"],
+            "blacklist":          {k: round(v - time.time()) for k, v in bot_state["blacklist"].items() if v > time.time()},
+            "log":                bot_state["log"][-50:],
         })
 
 
