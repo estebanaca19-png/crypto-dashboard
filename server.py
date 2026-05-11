@@ -354,6 +354,56 @@ def mi_ip():
     return jsonify(r.json())
 
 
+@app.route("/bot/portfolio")
+def bot_portfolio():
+    """Retorna el portafolio real desde Binance con valor actual por moneda."""
+    try:
+        client  = get_client()
+        cuenta  = client.get_account()
+        data    = []
+        exclude = {"USDT", "BNB"}  # BNB se usa para fees, lo excluimos del portfolio trading
+
+        for b in cuenta["balances"]:
+            asset = b["asset"]
+            free  = float(b["free"])
+            locked = float(b["locked"])
+            total = free + locked
+            if total <= 0 or asset == "USDT":
+                continue
+            symbol = asset + "USDT"
+            try:
+                ticker     = client.get_ticker(symbol=symbol)
+                price      = float(ticker["lastPrice"])
+                valor_actual = total * price
+                if valor_actual < 0.5:  # ignorar dust
+                    continue
+                # Precio de compra del bot si existe posición
+                pos = bot_state["positions"].get(symbol)
+                buy_price  = pos["buy_price"] if pos else None
+                costo      = pos["cost"] if pos and "cost" in pos else (buy_price * pos["qty"] if pos else None)
+                pnl        = (price - buy_price) * total if buy_price else None
+                pnl_pct    = ((price - buy_price) / buy_price * 100) if buy_price else None
+
+                data.append({
+                    "asset":        asset,
+                    "symbol":       symbol,
+                    "cantidad":     round(total, 6),
+                    "precio":       price,
+                    "valor_actual": round(valor_actual, 2),
+                    "buy_price":    round(buy_price, 6) if buy_price else None,
+                    "costo":        round(costo, 2) if costo else None,
+                    "pnl":          round(pnl, 2) if pnl is not None else None,
+                    "pnl_pct":      round(pnl_pct, 2) if pnl_pct is not None else None,
+                })
+            except Exception:
+                continue  # par no existe en Binance (ej. activos de staking)
+
+        data.sort(key=lambda x: x["valor_actual"], reverse=True)
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 # ─── Endpoints del Bot ────────────────────────────────────────────────────────
 
 @app.route("/bot/start", methods=["POST"])
