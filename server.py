@@ -3,6 +3,8 @@ from flask_cors import CORS
 from binance.client import Client
 from binance.enums import SIDE_BUY, SIDE_SELL, ORDER_TYPE_MARKET
 import os, time, threading, logging, json
+import psycopg2
+from psycopg2.extras import Json
 
 app = Flask(__name__)
 CORS(app)
@@ -12,36 +14,65 @@ logger = logging.getLogger(__name__)
 
 API_KEY    = os.environ.get("API_KEY")
 SECRET_KEY = os.environ.get("SECRET_KEY")
+DATABASE_URL = os.environ.get("DATABASE_URL")
 
-# ─── Persistencia ─────────────────────────────────────────────────────────────
-STATE_FILE = "/app/bot_state_saved.json"
+# ─── PostgreSQL Persistencia ──────────────────────────────────────────────────
+def get_db():
+    return psycopg2.connect(DATABASE_URL, sslmode='require')
+
+def init_db():
+    """Crea la tabla si no existe."""
+    try:
+        conn = get_db()
+        cur  = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS bot_state (
+                key TEXT PRIMARY KEY,
+                value JSONB NOT NULL
+            )
+        """)
+        conn.commit()
+        cur.close()
+        conn.close()
+        logger.info("✓ Base de datos inicializada.")
+    except Exception as e:
+        logger.error(f"Error iniciando DB: {e}")
 
 def save_state():
-    """Guarda posiciones y stats en disco para sobrevivir reinicios."""
+    """Guarda posiciones y stats en PostgreSQL."""
     try:
-        data = {
+        conn = get_db()
+        cur  = conn.cursor()
+        data = json.dumps({
             "positions": bot_state["positions"],
             "stats":     bot_state["stats"],
-        }
-        with open(STATE_FILE, "w") as f:
-            json.dump(data, f)
+        })
+        cur.execute("""
+            INSERT INTO bot_state (key, value) VALUES ('state', %s::jsonb)
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+        """, (data,))
+        conn.commit()
+        cur.close()
+        conn.close()
     except Exception as e:
-        logger.error(f"Error guardando estado: {e}")
+        logger.error(f"Error guardando estado en DB: {e}")
 
 def load_state():
-    """Carga posiciones y stats desde disco al arrancar."""
+    """Carga posiciones y stats desde PostgreSQL al arrancar."""
     try:
-        if os.path.exists(STATE_FILE):
-            with open(STATE_FILE, "r") as f:
-                data = json.load(f)
+        conn = get_db()
+        cur  = conn.cursor()
+        cur.execute("SELECT value FROM bot_state WHERE key = 'state'")
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+        if row:
+            data = row[0]
             bot_state["positions"] = data.get("positions", {})
             bot_state["stats"]     = data.get("stats", bot_state["stats"])
-            logger.info(f"✓ Estado restaurado: {len(bot_state['positions'])} posiciones cargadas.")
+            logger.info(f"✓ Estado restaurado desde DB: {len(bot_state['positions'])} posiciones.")
     except Exception as e:
-        logger.error(f"Error cargando estado: {e}")
-
-API_KEY    = os.environ.get("API_KEY")
-SECRET_KEY = os.environ.get("SECRET_KEY")
+        logger.error(f"Error cargando estado desde DB: {e}")
 
 # ─── Cache ───────────────────────────────────────────────────────────────────
 cache = {}
@@ -412,15 +443,6 @@ def mi_ip():
 
 
 @app.route("/bot/set_position", methods=["POST"])
-@app.route("/bot/clear_position", methods=["POST"])
-def clear_position():
-    data = request.get_json(silent=True) or {}
-    symbol = data.get("symbol")
-    with bot_lock:
-        if symbol in bot_state["positions"]:
-            del bot_state["positions"][symbol]
-    save_state()
-    return jsonify({"ok": True, "msg": f"Posición {symbol} eliminada"})
 def set_position():
     """Registra manualmente una posición con precio de compra conocido."""
     data = request.get_json(silent=True) or {}
@@ -564,7 +586,8 @@ def bot_config():
 # ─── Auto-arranque al cargar el módulo (compatible con gunicorn) ──────────────
 def _auto_start():
     global bot_thread
-    load_state()  # restaurar posiciones y stats desde disco
+    init_db()       # inicializar tabla en PostgreSQL
+    load_state()    # restaurar posiciones y stats desde DB
     bot_state["running"] = True
     bot_thread = threading.Thread(target=bot_loop, daemon=True)
     bot_thread.start()
