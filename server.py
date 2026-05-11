@@ -769,14 +769,21 @@ def set_position():
     qty       = float(data.get("qty", 0))
     if not symbol or not buy_price or not qty:
         return jsonify({"ok": False, "msg": "Faltan datos"}), 400
-    with bot_lock:
+    acquired = bot_lock.acquire(timeout=5)
+    if not acquired:
+        return jsonify({"ok": False, "msg": "Bot ocupado, intenta de nuevo"}), 503
+    try:
         bot_state["positions"][symbol] = {
-            "buy_price": buy_price,
-            "qty":       qty,
-            "cost":      round(buy_price * qty, 2),
-            "buy_time":  time.time(),
-            "order_id":  "manual",
+            "buy_price":    buy_price,
+            "qty":          qty,
+            "cost":         round(buy_price * qty, 2),
+            "buy_time":     time.time(),
+            "order_id":     "manual",
+            "partial_sold": False,
+            "is_volatile":  False,
         }
+    finally:
+        bot_lock.release()
     save_state()
     return jsonify({"ok": True, "msg": f"Posición {symbol} registrada @ ${buy_price}"})
 
@@ -788,9 +795,14 @@ def clear_position():
     symbol = data.get("symbol")
     if not symbol:
         return jsonify({"ok": False, "msg": "Falta symbol"}), 400
-    with bot_lock:
+    acquired = bot_lock.acquire(timeout=5)
+    if not acquired:
+        return jsonify({"ok": False, "msg": "Bot ocupado, intenta de nuevo"}), 503
+    try:
         if symbol in bot_state["positions"]:
             del bot_state["positions"][symbol]
+    finally:
+        bot_lock.release()
     save_state()
     return jsonify({"ok": True, "msg": f"Posición {symbol} eliminada"})
 
