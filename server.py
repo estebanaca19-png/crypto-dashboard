@@ -3,8 +3,7 @@ from flask_cors import CORS
 from binance.client import Client
 from binance.enums import SIDE_BUY, SIDE_SELL, ORDER_TYPE_MARKET
 import os, time, threading, logging, json
-import psycopg2
-from psycopg2.extras import Json
+import pg8000.native as pg8000
 
 app = Flask(__name__)
 CORS(app)
@@ -18,21 +17,27 @@ DATABASE_URL = os.environ.get("DATABASE_URL")
 
 # ─── PostgreSQL Persistencia ──────────────────────────────────────────────────
 def get_db():
-    return psycopg2.connect(DATABASE_URL, sslmode='require')
+    from urllib.parse import urlparse
+    url = urlparse(DATABASE_URL)
+    return pg8000.Connection(
+        host=url.hostname,
+        port=url.port or 5432,
+        database=url.path[1:],
+        user=url.username,
+        password=url.password,
+        ssl_context=True
+    )
 
 def init_db():
     """Crea la tabla si no existe."""
     try:
         conn = get_db()
-        cur  = conn.cursor()
-        cur.execute("""
+        conn.run("""
             CREATE TABLE IF NOT EXISTS bot_state (
                 key TEXT PRIMARY KEY,
-                value JSONB NOT NULL
+                value TEXT NOT NULL
             )
         """)
-        conn.commit()
-        cur.close()
         conn.close()
         logger.info("✓ Base de datos inicializada.")
     except Exception as e:
@@ -42,17 +47,14 @@ def save_state():
     """Guarda posiciones y stats en PostgreSQL."""
     try:
         conn = get_db()
-        cur  = conn.cursor()
         data = json.dumps({
             "positions": bot_state["positions"],
             "stats":     bot_state["stats"],
         })
-        cur.execute("""
-            INSERT INTO bot_state (key, value) VALUES ('state', %s::jsonb)
+        conn.run("""
+            INSERT INTO bot_state (key, value) VALUES ('state', :data)
             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
-        """, (data,))
-        conn.commit()
-        cur.close()
+        """, data=data)
         conn.close()
     except Exception as e:
         logger.error(f"Error guardando estado en DB: {e}")
@@ -61,13 +63,10 @@ def load_state():
     """Carga posiciones y stats desde PostgreSQL al arrancar."""
     try:
         conn = get_db()
-        cur  = conn.cursor()
-        cur.execute("SELECT value FROM bot_state WHERE key = 'state'")
-        row = cur.fetchone()
-        cur.close()
+        rows = conn.run("SELECT value FROM bot_state WHERE key = 'state'")
         conn.close()
-        if row:
-            data = row[0]
+        if rows:
+            data = json.loads(rows[0][0])
             bot_state["positions"] = data.get("positions", {})
             bot_state["stats"]     = data.get("stats", bot_state["stats"])
             logger.info(f"✓ Estado restaurado desde DB: {len(bot_state['positions'])} posiciones.")
