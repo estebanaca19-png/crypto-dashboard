@@ -36,7 +36,7 @@ bot_state = {
     "pairs": ["BTCUSDT","ETHUSDT","DOGEUSDT","SOLUSDT","BNBUSDT","XRPUSDT","ADAUSDT","AVAXUSDT","MATICUSDT","DOTUSDT","LINKUSDT","LTCUSDT"],
     "profit_target": 0.8,   # % mínimo de ganancia para vender vs precio de compra
     "drop_to_buy": 0.15,    # % de caída en los últimos N segundos para comprar
-    "trade_amount": 60,    # USDT por operación
+    "trade_amount": 50,    # USDT por operación
     "interval": 60,         # segundos entre ciclos
     "positions": {},         # {symbol: {buy_price, qty, buy_time}}
     "log": [],
@@ -49,6 +49,7 @@ bot_state = {
     },
     "last_prices": {},
     "last_changes": {},  # cambio 24h por par
+    "usdt_available": 0.0,
 }
 
 bot_thread = None
@@ -84,10 +85,24 @@ def calc_qty(symbol, price, usdt_amount):
 def bot_cycle():
     client = get_client()
     with bot_lock:
-        pairs        = list(bot_state["pairs"])
+        pairs         = list(bot_state["pairs"])
         profit_target = bot_state["profit_target"] / 100
-        drop_to_buy  = bot_state["drop_to_buy"] / 100
-        trade_amount = bot_state["trade_amount"]
+        drop_to_buy   = bot_state["drop_to_buy"] / 100
+        trade_amount  = bot_state["trade_amount"]
+
+    # ── Verificar balance USDT disponible ────────────────────────────────────
+    try:
+        account = client.get_account()
+        usdt_free = 0.0
+        for b in account["balances"]:
+            if b["asset"] == "USDT":
+                usdt_free = float(b["free"])
+                break
+        with bot_lock:
+            bot_state["usdt_available"] = usdt_free
+    except Exception as e:
+        bot_log(f"✗ Error obteniendo balance: {e}", "error")
+        usdt_free = 0.0
 
     for symbol in pairs:
         try:
@@ -96,17 +111,20 @@ def bot_cycle():
 
             with bot_lock:
                 prev_price = bot_state["last_prices"].get(symbol)
-                # Cambio real respecto al ciclo anterior (últimos N segundos)
                 if prev_price:
                     real_change = ((price - prev_price) / prev_price) * 100
                 else:
                     real_change = 0.0
                 bot_state["last_prices"][symbol]  = price
-                bot_state["last_changes"][symbol] = real_change  # cambio vs ciclo anterior
+                bot_state["last_changes"][symbol] = real_change
                 position = bot_state["positions"].get(symbol)
 
-            # ── Señal de COMPRA: precio bajó ≥X% respecto al ciclo anterior ──
+            # ── Señal de COMPRA ───────────────────────────────────────────────
             if position is None and prev_price and real_change <= -drop_to_buy:
+                # Verificar que hay suficiente USDT
+                if usdt_free < trade_amount:
+                    bot_log(f"⚠ Sin USDT suficiente para {symbol} (disponible: ${usdt_free:.2f})", "info")
+                    continue
                 qty = calc_qty(symbol, price, trade_amount)
                 try:
                     order = client.create_order(
@@ -115,6 +133,22 @@ def bot_cycle():
                         type=ORDER_TYPE_MARKET,
                         quantity=qty
                     )
+                    fill_price = float(order["fills"][0]["price"]) if order.get("fills") else price
+                    costo = fill_price * qty
+                    usdt_free -= costo  # actualizar balance local
+                    with bot_lock:
+                        bot_state["positions"][symbol] = {
+                            "buy_price": fill_price,
+                            "qty": qty,
+                            "cost": costo,
+                            "buy_time": time.time(),
+                            "order_id": order["orderId"],
+                        }
+                        bot_state["stats"]["trades"] += 1
+                        bot_state["usdt_available"] = usdt_free
+                    bot_log(f"▲ BUY  {symbol} @ ${fill_price:.4f} | qty: {qty} | costo: ${costo:.2f} | caída: {real_change:.3f}%", "buy")
+                except Exception as e:
+                    bot_log(f"✗ Error BUY {symbol}: {e}", "error")
                     fill_price = float(order["fills"][0]["price"]) if order.get("fills") else price
                     with bot_lock:
                         bot_state["positions"][symbol] = {
@@ -368,6 +402,7 @@ def bot_status():
             "stats":         bot_state["stats"],
             "last_prices":   bot_state["last_prices"],
             "last_changes":  bot_state["last_changes"],
+            "usdt_available": bot_state["usdt_available"],
             "log":           bot_state["log"][-50:],
         })
 
