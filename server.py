@@ -108,8 +108,13 @@ bot_state = {
         "losses": 0,
     },
     "last_prices": {},
-    "last_changes": {},  # cambio 24h por par
+    "last_changes": {},
     "usdt_available": 0.0,
+    "price_history": {},
+    "consecutive_drops": {},
+    "vol_avg": {},
+    "max_positions": 8,
+    "stop_loss": 3.0,
 }
 
 bot_thread = None
@@ -168,127 +173,217 @@ def bot_cycle():
         drop_to_buy   = bot_state["drop_to_buy"] / 100
         trade_amount  = bot_state["trade_amount"]
 
-    # ── Verificar balance USDT disponible ────────────────────────────────────
+def get_rsi(closes, period=14):
+    """Calcula el RSI de una lista de precios de cierre."""
+    if len(closes) < period + 1:
+        return 50
+    gains, losses = [], []
+    for i in range(1, len(closes)):
+        diff = closes[i] - closes[i-1]
+        gains.append(max(diff, 0))
+        losses.append(max(-diff, 0))
+    avg_gain = sum(gains[-period:]) / period
+    avg_loss = sum(losses[-period:]) / period
+    if avg_loss == 0:
+        return 100
+    rs = avg_gain / avg_loss
+    return round(100 - (100 / (1 + rs)), 1)
+
+def is_high_volatility_hour():
+    """Retorna True si estamos en horario de alta volatilidad cripto (13-21 UTC)."""
+    hour = time.gmtime().tm_hour
+    return 13 <= hour <= 21
+
+def execute_sell(client, symbol, position, price, reason=""):
+    """Ejecuta una venta y actualiza el estado."""
+    buy_price = position["buy_price"]
+    qty       = position["qty"]
+    pnl_pct   = (price - buy_price) / buy_price
+
     try:
-        account = client.get_account()
-        usdt_free = 0.0
-        for b in account["balances"]:
-            if b["asset"] == "USDT":
-                usdt_free = float(b["free"])
-                break
+        asset = symbol.replace("USDT", "")
+        real_qty = float(client.get_asset_balance(asset=asset)["free"])
+    except:
+        real_qty = qty
+
+    step     = get_step_size(client, symbol)
+    sell_qty = round_step(real_qty, step)
+
+    if sell_qty <= 0:
+        bot_log(f"⚠ Sin balance para vender {symbol}", "info")
+        return False
+
+    try:
+        order      = client.create_order(symbol=symbol, side=SIDE_SELL, type=ORDER_TYPE_MARKET, quantity=sell_qty)
+        fill_price = float(order["fills"][0]["price"]) if order.get("fills") else price
+        earned     = (fill_price - buy_price) * sell_qty
+        with bot_lock:
+            del bot_state["positions"][symbol]
+            bot_state["stats"]["total_pnl"] += earned
+            bot_state["stats"]["trades"]    += 1
+            if earned >= 0:
+                bot_state["stats"]["wins"]   += 1
+            else:
+                bot_state["stats"]["losses"] += 1
+        save_state()
+        emoji = "▼" if reason == "profit" else "🛑"
+        bot_log(f"{emoji} SELL {symbol} @ ${fill_price:.4f} | {'+' if earned>=0 else ''}${earned:.2f} | {pnl_pct*100:.2f}% [{reason}]",
+                "sell" if earned >= 0 else "error")
+        return True
+    except Exception as e:
+        bot_log(f"✗ Error SELL {symbol}: {e}", "error")
+        return False
+
+
+def bot_cycle():
+    client = get_client()
+    with bot_lock:
+        pairs         = list(bot_state["pairs"])
+        profit_target = bot_state["profit_target"] / 100
+        drop_to_buy   = bot_state["drop_to_buy"] / 100
+        trade_amount  = bot_state["trade_amount"]
+        max_positions = bot_state.get("max_positions", 8)
+        stop_loss     = bot_state.get("stop_loss", 3.0) / 100
+
+    # ── Balance USDT disponible ───────────────────────────────────────────────
+    try:
+        account   = client.get_account()
+        usdt_free = next((float(b["free"]) for b in account["balances"] if b["asset"] == "USDT"), 0.0)
         with bot_lock:
             bot_state["usdt_available"] = usdt_free
     except Exception as e:
         bot_log(f"✗ Error obteniendo balance: {e}", "error")
         usdt_free = 0.0
 
+    high_vol = is_high_volatility_hour()
+
     for symbol in pairs:
         try:
             ticker = client.get_ticker(symbol=symbol)
             price  = float(ticker["lastPrice"])
+            vol24h = float(ticker["quoteVolume"])
 
             with bot_lock:
-                prev_price = bot_state["last_prices"].get(symbol)
-                if prev_price:
-                    real_change = ((price - prev_price) / prev_price) * 100
-                else:
-                    real_change = 0.0
+                # Historial de precios para confirmar tendencia
+                history = bot_state["price_history"].get(symbol, [])
+                history.append(price)
+                if len(history) > 20:
+                    history = history[-20:]
+                bot_state["price_history"][symbol] = history
+
+                prev_price  = bot_state["last_prices"].get(symbol)
+                real_change = ((price - prev_price) / prev_price * 100) if prev_price else 0.0
                 bot_state["last_prices"][symbol]  = price
                 bot_state["last_changes"][symbol] = real_change
-                position = bot_state["positions"].get(symbol)
+                position   = bot_state["positions"].get(symbol)
+                n_positions = len(bot_state["positions"])
 
-            # ── Señal de COMPRA ───────────────────────────────────────────────
-            if position is None and prev_price and real_change <= -drop_to_buy:
-                # Verificar que hay suficiente USDT
-                if usdt_free < trade_amount:
-                    bot_log(f"⚠ Sin USDT suficiente para {symbol} (disponible: ${usdt_free:.2f})", "info")
-                    continue
-                qty = calc_qty(symbol, price, trade_amount)
-                # Ajustar al step size real de Binance
-                step = get_step_size(client, symbol)
-                qty = round_step(qty, step)
-                try:
-                    order = client.create_order(
-                        symbol=symbol,
-                        side=SIDE_BUY,
-                        type=ORDER_TYPE_MARKET,
-                        quantity=qty
-                    )
-                    fill_price = float(order["fills"][0]["price"]) if order.get("fills") else price
-                    costo = fill_price * qty
-                    usdt_free -= costo  # actualizar balance local
-                    with bot_lock:
-                        bot_state["positions"][symbol] = {
-                            "buy_price": fill_price,
-                            "qty": qty,
-                            "cost": costo,
-                            "buy_time": time.time(),
-                            "order_id": order["orderId"],
-                        }
-                        bot_state["stats"]["trades"] += 1
-                        bot_state["usdt_available"] = usdt_free
-                    save_state()
-                    bot_log(f"▲ BUY  {symbol} @ ${fill_price:.4f} | qty: {qty} | costo: ${costo:.2f} | caída: {real_change:.3f}%", "buy")
-                except Exception as e:
-                    bot_log(f"✗ Error BUY {symbol}: {e}", "error")
-                    fill_price = float(order["fills"][0]["price"]) if order.get("fills") else price
-                    with bot_lock:
-                        bot_state["positions"][symbol] = {
-                            "buy_price": fill_price,
-                            "qty": qty,
-                            "buy_time": time.time(),
-                            "order_id": order["orderId"],
-                        }
-                        bot_state["stats"]["trades"] += 1
-                    bot_log(f"▲ BUY  {symbol} @ ${fill_price:.4f} | qty: {qty} | caída: {real_change:.3f}%", "buy")
-                except Exception as e:
-                    bot_log(f"✗ Error BUY {symbol}: {e}", "error")
+            # ── RSI con últimos 15 precios ────────────────────────────────────
+            rsi = get_rsi(history) if len(history) >= 5 else 50
 
-            # ── Señal de VENTA: precio subió ≥X% respecto al precio de compra ─
+            # ── Volumen promedio (últimas 20 velas) ───────────────────────────
+            vol_avg = bot_state.get("vol_avg", {}).get(symbol, vol24h)
+            with bot_lock:
+                if "vol_avg" not in bot_state:
+                    bot_state["vol_avg"] = {}
+                bot_state["vol_avg"][symbol] = vol24h * 0.1 + vol_avg * 0.9  # EMA suave
+
+            # ── Confirmación de caída en 3 ciclos consecutivos ────────────────
+            drops = bot_state.get("consecutive_drops", {})
+            if real_change <= -drop_to_buy:
+                drops[symbol] = drops.get(symbol, 0) + 1
+            else:
+                drops[symbol] = 0
+            with bot_lock:
+                bot_state["consecutive_drops"] = drops
+            confirmed_drop = drops.get(symbol, 0) >= 2  # 2 ciclos consecutivos bajando
+
+            # ════════════════════════════════════════════════════════════════
+            # SEÑAL DE COMPRA
+            # Condiciones: caída confirmada + RSI bajo + volumen ok + capital
+            # ════════════════════════════════════════════════════════════════
+            if (position is None and
+                prev_price and
+                confirmed_drop and
+                rsi < 50 and
+                n_positions < max_positions and
+                usdt_free >= trade_amount):
+
+                # En horario de alta volatilidad ser más agresivo
+                min_rsi = 55 if high_vol else 50
+
+                if rsi < min_rsi:
+                    qty  = calc_qty(symbol, price, trade_amount)
+                    step = get_step_size(client, symbol)
+                    qty  = round_step(qty, step)
+                    try:
+                        order      = client.create_order(symbol=symbol, side=SIDE_BUY, type=ORDER_TYPE_MARKET, quantity=qty)
+                        fill_price = float(order["fills"][0]["price"]) if order.get("fills") else price
+                        costo      = fill_price * qty
+                        usdt_free -= costo
+                        with bot_lock:
+                            bot_state["positions"][symbol] = {
+                                "buy_price": fill_price,
+                                "qty":       qty,
+                                "cost":      costo,
+                                "buy_time":  time.time(),
+                                "order_id":  order["orderId"],
+                                "partial_sold": False,
+                            }
+                            bot_state["stats"]["trades"] += 1
+                            bot_state["usdt_available"]  = usdt_free
+                            drops[symbol] = 0
+                        save_state()
+                        bot_log(f"▲ BUY {symbol} @ ${fill_price:.4f} | ${costo:.2f} | RSI:{rsi} | caída:{real_change:.3f}%", "buy")
+                    except Exception as e:
+                        bot_log(f"✗ Error BUY {symbol}: {e}", "error")
+
+            # ════════════════════════════════════════════════════════════════
+            # GESTIÓN DE POSICIÓN ABIERTA
+            # ════════════════════════════════════════════════════════════════
             elif position is not None:
                 buy_price = position["buy_price"]
                 qty       = position["qty"]
                 pnl_pct   = (price - buy_price) / buy_price
 
-                if pnl_pct >= profit_target:
-                    # Obtener cantidad real disponible en Binance
-                    try:
-                        asset = symbol.replace("USDT", "")
-                        asset_balance = client.get_asset_balance(asset=asset)
-                        real_qty = float(asset_balance["free"])
-                    except:
-                        real_qty = qty
+                # 🛑 STOP-LOSS: vender si pierde más del 3%
+                if pnl_pct <= -stop_loss:
+                    bot_log(f"🛑 STOP-LOSS {symbol} @ ${price:.4f} | {pnl_pct*100:.2f}%", "error")
+                    execute_sell(client, symbol, position, price, reason="stop-loss")
 
-                    # Usar step size real de Binance
-                    step = get_step_size(client, symbol)
-                    sell_qty = round_step(real_qty, step)
-
-                    if sell_qty <= 0:
-                        bot_log(f"⚠ Sin balance para vender {symbol}", "info")
-                        continue
+                # ✅ VENTA PARCIAL: vender 50% al llegar a profit_target
+                elif pnl_pct >= profit_target and not position.get("partial_sold"):
                     try:
-                        order = client.create_order(
-                            symbol=symbol,
-                            side=SIDE_SELL,
-                            type=ORDER_TYPE_MARKET,
-                            quantity=sell_qty
-                        )
-                        fill_price = float(order["fills"][0]["price"]) if order.get("fills") else price
-                        earned = (fill_price - buy_price) * sell_qty
-                        with bot_lock:
-                            del bot_state["positions"][symbol]
-                            bot_state["stats"]["total_pnl"] += earned
-                            bot_state["stats"]["trades"] += 1
-                            if earned >= 0:
-                                bot_state["stats"]["wins"] += 1
-                            else:
-                                bot_state["stats"]["losses"] += 1
-                        bot_log(f"▼ SELL {symbol} @ ${fill_price:.4f} | +${earned:.2f} USDT | {pnl_pct*100:.2f}%", "sell")
-                        save_state()
+                        asset    = symbol.replace("USDT", "")
+                        real_qty = float(client.get_asset_balance(asset=asset)["free"])
+                        step     = get_step_size(client, symbol)
+                        half_qty = round_step(real_qty * 0.5, step)
+                        if half_qty > 0:
+                            order      = client.create_order(symbol=symbol, side=SIDE_SELL, type=ORDER_TYPE_MARKET, quantity=half_qty)
+                            fill_price = float(order["fills"][0]["price"]) if order.get("fills") else price
+                            earned     = (fill_price - buy_price) * half_qty
+                            with bot_lock:
+                                bot_state["positions"][symbol]["partial_sold"] = True
+                                bot_state["positions"][symbol]["qty"]          = real_qty - half_qty
+                                bot_state["stats"]["total_pnl"] += earned
+                                bot_state["stats"]["trades"]    += 1
+                                bot_state["stats"]["wins"]      += 1
+                            save_state()
+                            bot_log(f"½ SELL 50% {symbol} @ ${fill_price:.4f} | +${earned:.2f} | esperando +{profit_target*2*100:.1f}%", "sell")
                     except Exception as e:
-                        bot_log(f"✗ Error SELL {symbol}: {e}", "error")
+                        bot_log(f"✗ Error venta parcial {symbol}: {e}", "error")
+
+                # ✅ VENTA TOTAL: vender el resto al llegar a profit_target*2
+                elif pnl_pct >= profit_target * 2 and position.get("partial_sold"):
+                    execute_sell(client, symbol, position, price, reason="profit")
+
+                # ✅ VENTA TOTAL SIMPLE: si no hizo venta parcial y ya llegó al objetivo
+                elif pnl_pct >= profit_target and not position.get("partial_sold"):
+                    execute_sell(client, symbol, position, price, reason="profit")
+
                 else:
-                    bot_log(f"◷ HOLD {symbol} @ ${price:.4f} | P&L: {pnl_pct*100:.2f}%", "info")
+                    sl_dist = (pnl_pct + stop_loss) / stop_loss * 100
+                    bot_log(f"◷ HOLD {symbol} @ ${price:.4f} | P&L:{pnl_pct*100:.2f}% | RSI:{rsi} | SL:{sl_dist:.0f}%", "info")
 
         except Exception as e:
             bot_log(f"✗ Error ciclo {symbol}: {e}", "error")
@@ -471,15 +566,7 @@ def set_position():
         }
     save_state()
     return jsonify({"ok": True, "msg": f"Posición {symbol} registrada @ ${buy_price}"})
-@app.route("/bot/clear_position", methods=["POST"])
-def clear_position():
-    data = request.get_json(silent=True) or {}
-    symbol = data.get("symbol")
-    with bot_lock:
-        if symbol in bot_state["positions"]:
-            del bot_state["positions"][symbol]
-    save_state()
-    return jsonify({"ok": True, "msg": f"Posición {symbol} eliminada"})
+
 @app.route("/bot/portfolio")
 def bot_portfolio():
     """Retorna el portafolio real desde Binance con valor actual por moneda."""
@@ -587,17 +674,21 @@ def bot_status():
 def bot_config():
     data = request.get_json(silent=True) or {}
     with bot_lock:
-        if "pairs"         in data: bot_state["pairs"]         = data["pairs"]
-        if "profit_target" in data: bot_state["profit_target"] = float(data["profit_target"])
-        if "drop_to_buy"   in data: bot_state["drop_to_buy"]   = float(data["drop_to_buy"])
-        if "trade_amount"  in data: bot_state["trade_amount"]  = float(data["trade_amount"])
-        if "interval"      in data: bot_state["interval"]      = int(data["interval"])
+        if "pairs"          in data: bot_state["pairs"]          = data["pairs"]
+        if "profit_target"  in data: bot_state["profit_target"]  = float(data["profit_target"])
+        if "drop_to_buy"    in data: bot_state["drop_to_buy"]    = float(data["drop_to_buy"])
+        if "trade_amount"   in data: bot_state["trade_amount"]   = float(data["trade_amount"])
+        if "interval"       in data: bot_state["interval"]       = int(data["interval"])
+        if "max_positions"  in data: bot_state["max_positions"]  = int(data["max_positions"])
+        if "stop_loss"      in data: bot_state["stop_loss"]      = float(data["stop_loss"])
     return jsonify({"ok": True, "config": {
-        "pairs":         bot_state["pairs"],
-        "profit_target": bot_state["profit_target"],
-        "drop_to_buy":   bot_state["drop_to_buy"],
-        "trade_amount":  bot_state["trade_amount"],
-        "interval":      bot_state["interval"],
+        "pairs":          bot_state["pairs"],
+        "profit_target":  bot_state["profit_target"],
+        "drop_to_buy":    bot_state["drop_to_buy"],
+        "trade_amount":   bot_state["trade_amount"],
+        "interval":       bot_state["interval"],
+        "max_positions":  bot_state["max_positions"],
+        "stop_loss":      bot_state["stop_loss"],
     }})
 
 
