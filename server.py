@@ -412,6 +412,15 @@ def mi_ip():
 
 
 @app.route("/bot/set_position", methods=["POST"])
+@app.route("/bot/clear_position", methods=["POST"])
+def clear_position():
+    data = request.get_json(silent=True) or {}
+    symbol = data.get("symbol")
+    with bot_lock:
+        if symbol in bot_state["positions"]:
+            del bot_state["positions"][symbol]
+    save_state()
+    return jsonify({"ok": True, "msg": f"Posición {symbol} eliminada"})
 def set_position():
     """Registra manualmente una posición con precio de compra conocido."""
     data = request.get_json(silent=True) or {}
