@@ -179,13 +179,21 @@ def calc_qty(symbol, price, usdt_amount):
         return round(qty, 2)
 
 
-def bot_cycle():
-    client = get_client()
-    with bot_lock:
-        pairs         = list(bot_state["pairs"])
-        profit_target = bot_state["profit_target"] / 100
-        drop_to_buy   = bot_state["drop_to_buy"] / 100
-        trade_amount  = bot_state["trade_amount"]
+def get_rsi(closes, period=14):
+    """Calcula el RSI de una lista de precios de cierre."""
+    if len(closes) < period + 1:
+        return 50
+    gains, losses = [], []
+    for i in range(1, len(closes)):
+        diff = closes[i] - closes[i-1]
+        gains.append(max(diff, 0))
+        losses.append(max(-diff, 0))
+    avg_gain = sum(gains[-period:]) / period
+    avg_loss = sum(losses[-period:]) / period
+    if avg_loss == 0:
+        return 100
+    rs = avg_gain / avg_loss
+    return round(100 - (100 / (1 + rs)), 1)
 
 def is_blacklisted(symbol):
     """Verifica si un símbolo está en blacklist."""
