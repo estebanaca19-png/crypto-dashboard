@@ -65,13 +65,20 @@ def bot_log(msg, level="info"):
 
 
 def calc_qty(symbol, price, usdt_amount):
-    """Calcula la cantidad a comprar según el símbolo."""
-    if symbol in ("DOGEUSDT","ADAUSDT","MATICUSDT","XRPUSDT"):
-        return round(usdt_amount / price, 0)
-    elif symbol in ("BTCUSDT","ETHUSDT","SOLUSDT","AVAXUSDT","DOTUSDT","LINKUSDT","LTCUSDT","BNBUSDT"):
-        return round(usdt_amount / price, 4)
+    """Calcula la cantidad a comprar según las reglas de LOT_SIZE de Binance."""
+    qty = usdt_amount / price
+    if symbol in ("DOGEUSDT", "ADAUSDT", "XRPUSDT"):
+        return round(qty, 0)   # enteros
+    elif symbol in ("MATICUSDT",):
+        return round(qty, 1)
+    elif symbol in ("LTCUSDT", "BNBUSDT", "SOLUSDT", "AVAXUSDT", "DOTUSDT", "LINKUSDT"):
+        return round(qty, 2)
+    elif symbol in ("ETHUSDT",):
+        return round(qty, 4)
+    elif symbol in ("BTCUSDT",):
+        return round(qty, 5)
     else:
-        return round(usdt_amount / price, 4)
+        return round(qty, 2)
 
 
 def bot_cycle():
