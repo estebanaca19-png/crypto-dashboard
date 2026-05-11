@@ -1,21 +1,26 @@
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from binance.client import Client
-import os, time
+from binance.enums import SIDE_BUY, SIDE_SELL, ORDER_TYPE_MARKET
+import os, time, threading, logging
 
 app = Flask(__name__)
 CORS(app)
 
-API_KEY = os.environ.get("API_KEY")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger(__name__)
+
+API_KEY    = os.environ.get("API_KEY")
 SECRET_KEY = os.environ.get("SECRET_KEY")
 
+# ─── Cache ───────────────────────────────────────────────────────────────────
 cache = {}
 CACHE_TTL = 5
 
 def get_cache(key):
     if key in cache:
-        data, timestamp = cache[key]
-        if time.time() - timestamp < CACHE_TTL:
+        data, ts = cache[key]
+        if time.time() - ts < CACHE_TTL:
             return data
     return None
 
@@ -24,6 +29,145 @@ def set_cache(key, data):
 
 def get_client():
     return Client(API_KEY, SECRET_KEY, tld="com")
+
+# ─── Bot state ────────────────────────────────────────────────────────────────
+bot_state = {
+    "running": False,
+    "pairs": ["BTCUSDT", "ETHUSDT", "DOGEUSDT"],
+    "profit_target": 1.0,   # % mínimo de ganancia para vender
+    "drop_to_buy": 1.5,     # % de caída para comprar
+    "trade_amount": 100,    # USDT por operación
+    "interval": 60,         # segundos entre ciclos
+    "positions": {},         # {symbol: {buy_price, qty, buy_time}}
+    "log": [],
+    "stats": {
+        "trades": 0,
+        "total_pnl": 0.0,
+        "cycles": 0,
+        "wins": 0,
+        "losses": 0,
+    },
+    "last_prices": {},
+}
+
+bot_thread = None
+bot_lock   = threading.Lock()
+
+
+def bot_log(msg, level="info"):
+    entry = {"time": time.strftime("%H:%M:%S"), "msg": msg, "level": level}
+    with bot_lock:
+        bot_state["log"].append(entry)
+        if len(bot_state["log"]) > 200:
+            bot_state["log"] = bot_state["log"][-200:]
+    logger.info(msg)
+
+
+def calc_qty(symbol, price, usdt_amount):
+    """Calcula la cantidad a comprar según el símbolo."""
+    if symbol == "DOGEUSDT":
+        return round(usdt_amount / price, 0)
+    elif symbol == "ETHUSDT":
+        return round(usdt_amount / price, 4)
+    else:
+        return round(usdt_amount / price, 5)
+
+
+def bot_cycle():
+    client = get_client()
+    with bot_lock:
+        pairs        = list(bot_state["pairs"])
+        profit_target = bot_state["profit_target"] / 100
+        drop_to_buy  = bot_state["drop_to_buy"] / 100
+        trade_amount = bot_state["trade_amount"]
+
+    for symbol in pairs:
+        try:
+            ticker = client.get_ticker(symbol=symbol)
+            price  = float(ticker["lastPrice"])
+            change = float(ticker["priceChangePercent"]) / 100  # cambio 24h
+
+            with bot_lock:
+                bot_state["last_prices"][symbol] = price
+                position = bot_state["positions"].get(symbol)
+
+            # ── Señal de COMPRA ─────────────────────────────────────────────
+            if position is None and change <= -drop_to_buy:
+                qty = calc_qty(symbol, price, trade_amount)
+                try:
+                    order = client.create_order(
+                        symbol=symbol,
+                        side=SIDE_BUY,
+                        type=ORDER_TYPE_MARKET,
+                        quantity=qty
+                    )
+                    fill_price = float(order["fills"][0]["price"]) if order.get("fills") else price
+                    with bot_lock:
+                        bot_state["positions"][symbol] = {
+                            "buy_price": fill_price,
+                            "qty": qty,
+                            "buy_time": time.time(),
+                            "order_id": order["orderId"],
+                        }
+                        bot_state["stats"]["trades"] += 1
+                    bot_log(f"▲ BUY  {symbol} @ ${fill_price:.4f} | qty: {qty} | cambio24h: {change*100:.2f}%", "buy")
+                except Exception as e:
+                    bot_log(f"✗ Error BUY {symbol}: {e}", "error")
+
+            # ── Señal de VENTA ──────────────────────────────────────────────
+            elif position is not None:
+                buy_price = position["buy_price"]
+                qty       = position["qty"]
+                pnl_pct   = (price - buy_price) / buy_price
+
+                if pnl_pct >= profit_target:
+                    try:
+                        order = client.create_order(
+                            symbol=symbol,
+                            side=SIDE_SELL,
+                            type=ORDER_TYPE_MARKET,
+                            quantity=qty
+                        )
+                        fill_price = float(order["fills"][0]["price"]) if order.get("fills") else price
+                        earned = (fill_price - buy_price) * qty
+                        with bot_lock:
+                            del bot_state["positions"][symbol]
+                            bot_state["stats"]["total_pnl"] += earned
+                            bot_state["stats"]["trades"] += 1
+                            if earned >= 0:
+                                bot_state["stats"]["wins"] += 1
+                            else:
+                                bot_state["stats"]["losses"] += 1
+                        bot_log(f"▼ SELL {symbol} @ ${fill_price:.4f} | +${earned:.2f} USDT | {pnl_pct*100:.2f}%", "sell")
+                    except Exception as e:
+                        bot_log(f"✗ Error SELL {symbol}: {e}", "error")
+                else:
+                    bot_log(f"◷ HOLD {symbol} @ ${price:.4f} | P&L: {pnl_pct*100:.2f}%", "info")
+
+        except Exception as e:
+            bot_log(f"✗ Error ciclo {symbol}: {e}", "error")
+
+    with bot_lock:
+        bot_state["stats"]["cycles"] += 1
+
+
+def bot_loop():
+    bot_log("▶ Bot iniciado. Operando 24/7.", "info")
+    while True:
+        with bot_lock:
+            running  = bot_state["running"]
+            interval = bot_state["interval"]
+        if not running:
+            break
+        try:
+            bot_cycle()
+        except Exception as e:
+            bot_log(f"✗ Error general: {e}", "error")
+        time.sleep(interval)
+    bot_log("⏹ Bot detenido.", "info")
+
+
+# ─── Endpoints existentes ─────────────────────────────────────────────────────
 
 @app.route("/precios")
 def precios():
@@ -48,12 +192,13 @@ def precios():
     set_cache("precios", data)
     return jsonify(data)
 
+
 @app.route("/historial/<symbol>")
 def historial(symbol):
     intervalo = request.args.get("interval", "4h")
-    limite = int(request.args.get("limit", 24))
+    limite    = int(request.args.get("limit", 24))
     cache_key = f"historial_{symbol}_{intervalo}_{limite}"
-    cached = get_cache(cache_key)
+    cached    = get_cache(cache_key)
     if cached:
         return jsonify(cached)
     try:
@@ -65,49 +210,52 @@ def historial(symbol):
             "1w": Client.KLINE_INTERVAL_1WEEK
         }
         velas = client.get_klines(
-            symbol=symbol+"USDT",
+            symbol=symbol + "USDT",
             interval=intervalos.get(intervalo, Client.KLINE_INTERVAL_4HOUR),
             limit=limite
         )
-        data = [{"tiempo":v[0],"open":float(v[1]),"high":float(v[2]),"low":float(v[3]),"close":float(v[4]),"volumen":float(v[5])} for v in velas]
+        data = [{"tiempo": v[0], "open": float(v[1]), "high": float(v[2]),
+                 "low": float(v[3]), "close": float(v[4]), "volumen": float(v[5])}
+                for v in velas]
         set_cache(cache_key, data)
         return jsonify(data)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+
 @app.route("/resumen/<symbol>")
 def resumen(symbol):
     cache_key = f"resumen_{symbol}"
-    cached = get_cache(cache_key)
+    cached    = get_cache(cache_key)
     if cached:
         return jsonify(cached)
     try:
-        client = get_client()
-        velas = client.get_klines(symbol=symbol+"USDT", interval=Client.KLINE_INTERVAL_4HOUR, limit=24)
-        ticker = client.get_ticker(symbol=symbol+"USDT")
+        client  = get_client()
+        velas   = client.get_klines(symbol=symbol + "USDT", interval=Client.KLINE_INTERVAL_4HOUR, limit=24)
+        ticker  = client.get_ticker(symbol=symbol + "USDT")
         cierres = [float(v[4]) for v in velas]
         volumenes = [float(v[5]) for v in velas]
-        precio = float(ticker["lastPrice"])
+        precio    = float(ticker["lastPrice"])
         cambio24h = float(ticker["priceChangePercent"])
-        max24h = float(ticker["highPrice"])
-        min24h = float(ticker["lowPrice"])
-        vol24h = float(ticker["quoteVolume"])
+        max24h    = float(ticker["highPrice"])
+        min24h    = float(ticker["lowPrice"])
+        vol24h    = float(ticker["quoteVolume"])
         ganancias, perdidas = 0, 0
         for i in range(1, len(cierres)):
-            diff = cierres[i] - cierres[i-1]
+            diff = cierres[i] - cierres[i - 1]
             if diff > 0: ganancias += diff
             else: perdidas += abs(diff)
-        rsi = 100 if perdidas == 0 else 100-(100/(1+(ganancias/len(cierres))/(perdidas/len(cierres))))
-        mitad = len(cierres)//2
-        tendencia = "alcista" if sum(cierres[mitad:])/len(cierres[mitad:]) > sum(cierres[:mitad])/mitad else "bajista"
-        cambio4h = ((cierres[-1]-cierres[-2])/cierres[-2])*100
-        vol_prom = sum(volumenes)/len(volumenes)
-        vol_estado = "alto" if volumenes[-1]>vol_prom*1.2 else "bajo" if volumenes[-1]<vol_prom*0.8 else "normal"
-        if rsi<35 and tendencia=="alcista": señal="COMPRAR"
-        elif rsi>65 and tendencia=="bajista": señal="VENDER"
-        elif rsi<40: señal="COMPRAR"
-        elif rsi>60: señal="VENDER"
-        else: señal="MANTENER"
+        rsi = 100 if perdidas == 0 else 100 - (100 / (1 + (ganancias / len(cierres)) / (perdidas / len(cierres))))
+        mitad     = len(cierres) // 2
+        tendencia = "alcista" if sum(cierres[mitad:]) / len(cierres[mitad:]) > sum(cierres[:mitad]) / mitad else "bajista"
+        cambio4h  = ((cierres[-1] - cierres[-2]) / cierres[-2]) * 100
+        vol_prom  = sum(volumenes) / len(volumenes)
+        vol_estado = "alto" if volumenes[-1] > vol_prom * 1.2 else "bajo" if volumenes[-1] < vol_prom * 0.8 else "normal"
+        if rsi < 35 and tendencia == "alcista": señal = "COMPRAR"
+        elif rsi > 65 and tendencia == "bajista": señal = "VENDER"
+        elif rsi < 40: señal = "COMPRAR"
+        elif rsi > 60: señal = "VENDER"
+        else: señal = "MANTENER"
         prob_subida = 50
         if tendencia == "alcista": prob_subida += 20
         else: prob_subida -= 20
@@ -117,21 +265,21 @@ def resumen(symbol):
         else: prob_subida -= 10
         if vol_estado == "alto": prob_subida += 5
         prob_subida = max(5, min(95, prob_subida))
-        prob_bajada = 100 - prob_subida
         data = {
             "symbol": symbol, "precio": precio,
-            "cambio24h": round(cambio24h,2), "cambio4h": round(cambio4h,2),
-            "max24h": max24h, "min24h": min24h, "vol24h": round(vol24h,0),
-            "rsi": round(rsi,1), "tendencia": tendencia,
+            "cambio24h": round(cambio24h, 2), "cambio4h": round(cambio4h, 2),
+            "max24h": max24h, "min24h": min24h, "vol24h": round(vol24h, 0),
+            "rsi": round(rsi, 1), "tendencia": tendencia,
             "volumen_estado": vol_estado, "señal": señal,
-            "prob_subida": round(prob_subida,0),
-            "prob_bajada": round(prob_bajada,0),
+            "prob_subida": round(prob_subida, 0),
+            "prob_bajada": round(100 - prob_subida, 0),
             "cierres": cierres[-8:]
         }
         set_cache(cache_key, data)
         return jsonify(data)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
 
 @app.route("/balance")
 def balance():
@@ -143,12 +291,13 @@ def balance():
         cuenta = client.get_account()
         data = []
         for b in cuenta["balances"]:
-            if float(b["free"])>0 or float(b["locked"])>0:
-                data.append({"asset":b["asset"],"free":float(b["free"]),"locked":float(b["locked"])})
+            if float(b["free"]) > 0 or float(b["locked"]) > 0:
+                data.append({"asset": b["asset"], "free": float(b["free"]), "locked": float(b["locked"])})
         set_cache("balance", data)
         return jsonify(data)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
 
 @app.route("/mi-ip")
 def mi_ip():
@@ -156,5 +305,76 @@ def mi_ip():
     r = requests.get("https://api.ipify.org?format=json")
     return jsonify(r.json())
 
+
+# ─── Endpoints del Bot ────────────────────────────────────────────────────────
+
+@app.route("/bot/start", methods=["POST"])
+def bot_start():
+    global bot_thread
+    data = request.get_json(silent=True) or {}
+
+    with bot_lock:
+        if bot_state["running"]:
+            return jsonify({"ok": False, "msg": "Bot ya está corriendo"}), 400
+
+        # Actualizar configuración si se envió
+        if "pairs"         in data: bot_state["pairs"]         = data["pairs"]
+        if "profit_target" in data: bot_state["profit_target"] = float(data["profit_target"])
+        if "drop_to_buy"   in data: bot_state["drop_to_buy"]   = float(data["drop_to_buy"])
+        if "trade_amount"  in data: bot_state["trade_amount"]  = float(data["trade_amount"])
+        if "interval"      in data: bot_state["interval"]      = int(data["interval"])
+
+        bot_state["running"] = True
+
+    bot_thread = threading.Thread(target=bot_loop, daemon=True)
+    bot_thread.start()
+    return jsonify({"ok": True, "msg": "Bot iniciado"})
+
+
+@app.route("/bot/stop", methods=["POST"])
+def bot_stop():
+    with bot_lock:
+        if not bot_state["running"]:
+            return jsonify({"ok": False, "msg": "Bot no está corriendo"}), 400
+        bot_state["running"] = False
+    return jsonify({"ok": True, "msg": "Bot deteniendo..."})
+
+
+@app.route("/bot/status")
+def bot_status():
+    with bot_lock:
+        return jsonify({
+            "running":       bot_state["running"],
+            "pairs":         bot_state["pairs"],
+            "profit_target": bot_state["profit_target"],
+            "drop_to_buy":   bot_state["drop_to_buy"],
+            "trade_amount":  bot_state["trade_amount"],
+            "interval":      bot_state["interval"],
+            "positions":     bot_state["positions"],
+            "stats":         bot_state["stats"],
+            "last_prices":   bot_state["last_prices"],
+            "log":           bot_state["log"][-50:],
+        })
+
+
+@app.route("/bot/config", methods=["POST"])
+def bot_config():
+    data = request.get_json(silent=True) or {}
+    with bot_lock:
+        if "pairs"         in data: bot_state["pairs"]         = data["pairs"]
+        if "profit_target" in data: bot_state["profit_target"] = float(data["profit_target"])
+        if "drop_to_buy"   in data: bot_state["drop_to_buy"]   = float(data["drop_to_buy"])
+        if "trade_amount"  in data: bot_state["trade_amount"]  = float(data["trade_amount"])
+        if "interval"      in data: bot_state["interval"]      = int(data["interval"])
+    return jsonify({"ok": True, "config": {
+        "pairs":         bot_state["pairs"],
+        "profit_target": bot_state["profit_target"],
+        "drop_to_buy":   bot_state["drop_to_buy"],
+        "trade_amount":  bot_state["trade_amount"],
+        "interval":      bot_state["interval"],
+    }})
+
+
 if __name__ == "__main__":
-    app.run(debug=True)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=False)
