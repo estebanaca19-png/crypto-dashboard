@@ -189,6 +189,29 @@ def calc_qty(symbol, price, usdt_amount):
         return round(qty, 2)
 
 
+def get_rsi(closes, period=14):
+    """Calcula el RSI de una lista de precios de cierre."""
+    if len(closes) < period + 1:
+        return 50
+    gains, losses = [], []
+    for i in range(1, len(closes)):
+        diff = closes[i] - closes[i-1]
+        gains.append(max(diff, 0))
+        losses.append(max(-diff, 0))
+    avg_gain = sum(gains[-period:]) / period
+    avg_loss = sum(losses[-period:]) / period
+    if avg_loss == 0:
+        return 100
+    rs = avg_gain / avg_loss
+    return round(100 - (100 / (1 + rs)), 1)
+
+
+def is_high_volatility_hour():
+    """Retorna True si estamos en horario de alta volatilidad cripto (13-21 UTC)."""
+    hour = time.gmtime().tm_hour
+    return 13 <= hour <= 21
+
+
 def apply_reinvestment(earned):
     """Reinvierte un porcentaje de la ganancia aumentando el capital por trade."""
     if not bot_state.get("reinvest_enabled"):
@@ -282,10 +305,6 @@ def daily_goal_reached():
     rs = avg_gain / avg_loss
     return round(100 - (100 / (1 + rs)), 1)
 
-def is_high_volatility_hour():
-    """Retorna True si estamos en horario de alta volatilidad cripto (13-21 UTC)."""
-    hour = time.gmtime().tm_hour
-    return 13 <= hour <= 21
 
 def execute_sell(client, symbol, position, price, reason=""):
     """Ejecuta una venta y actualiza el estado."""
