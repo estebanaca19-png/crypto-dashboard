@@ -471,7 +471,15 @@ def set_position():
         }
     save_state()
     return jsonify({"ok": True, "msg": f"Posición {symbol} registrada @ ${buy_price}"})
-
+@app.route("/bot/clear_position", methods=["POST"])
+def clear_position():
+    data = request.get_json(silent=True) or {}
+    symbol = data.get("symbol")
+    with bot_lock:
+        if symbol in bot_state["positions"]:
+            del bot_state["positions"][symbol]
+    save_state()
+    return jsonify({"ok": True, "msg": f"Posición {symbol} eliminada"})
 @app.route("/bot/portfolio")
 def bot_portfolio():
     """Retorna el portafolio real desde Binance con valor actual por moneda."""
