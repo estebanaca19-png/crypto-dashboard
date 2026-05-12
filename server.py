@@ -2031,6 +2031,14 @@ def futures_cycle():
     try:
         client = get_futures_client()
 
+        # Pre-cargar señales ML para los pares de futuros
+        for sym in futures_state["pairs"]:
+            threading.Thread(target=get_taapi_signal, args=(sym,), daemon=True).start()
+            threading.Thread(target=get_santiment_sentiment, args=(sym,), daemon=True).start()
+        threading.Thread(target=get_fear_greed, daemon=True).start()
+        threading.Thread(target=update_openai_signal, daemon=True).start()
+        time.sleep(3)  # dar tiempo a las APIs
+
         for symbol in futures_state["pairs"]:
             try:
                 # Obtener precio actual
