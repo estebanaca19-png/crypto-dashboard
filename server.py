@@ -730,12 +730,40 @@ def bot_cycle():
 
 def bot_loop():
     bot_log("▶ Bot iniciado. Operando 24/7.", "info")
+    import os
+    my_pid = os.getpid()
     while True:
         with state_lock:
             running  = bot_state["running"]
             interval = bot_state["interval"]
         if not running:
             break
+        # Verificar que somos el worker activo via DB
+        try:
+            now = int(time.time())
+            conn = get_db()
+            conn.run("""
+                CREATE TABLE IF NOT EXISTS active_worker (
+                    id TEXT PRIMARY KEY, pid INT, ts BIGINT
+                )
+            """)
+            # Solo ejecutar si somos el worker registrado o si el último registro
+            # tiene más de 30 segundos (el otro worker murió)
+            rows = conn.run("SELECT pid, ts FROM active_worker WHERE id='bot'")
+            if rows:
+                db_pid, db_ts = rows[0][0], rows[0][1]
+                if db_pid != my_pid and (now - db_ts) < 30:
+                    conn.close()
+                    time.sleep(interval)
+                    continue
+            # Registrar este worker como activo
+            conn.run("""
+                INSERT INTO active_worker (id, pid, ts) VALUES ('bot', :pid, :ts)
+                ON CONFLICT (id) DO UPDATE SET pid=:pid, ts=:ts
+            """, pid=my_pid, ts=now)
+            conn.close()
+        except Exception as e:
+            logger.error(f"Error worker lock: {e}")
         try:
             bot_cycle()
         except Exception as e:
