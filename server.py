@@ -1705,3 +1705,4 @@ if __name__ == "__main__":
     bot_thread.start()
     logger.info("🚀 Servidor iniciado — bot arrancado automáticamente.")
     app.run(host="0.0.0.0", port=port, debug=False)
+    # update test
