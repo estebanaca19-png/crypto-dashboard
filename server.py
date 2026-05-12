@@ -1155,6 +1155,9 @@ def bot_config():
         if "interval"       in data: bot_state["interval"]       = int(data["interval"])
         if "max_positions"  in data: bot_state["max_positions"]  = int(data["max_positions"])
         if "stop_loss"      in data: bot_state["stop_loss"]      = float(data["stop_loss"])
+        if "dca_enabled"    in data: bot_state["dca_enabled"]    = bool(data["dca_enabled"])
+        if "volatile_amount" in data: bot_state["volatile_amount"] = float(data["volatile_amount"])
+        if "reinvest_pct"   in data: bot_state["reinvest_pct"]   = int(data["reinvest_pct"])
     return jsonify({"ok": True, "config": {
         "pairs":          bot_state["pairs"],
         "profit_target":  bot_state["profit_target"],
@@ -1163,6 +1166,7 @@ def bot_config():
         "interval":       bot_state["interval"],
         "max_positions":  bot_state["max_positions"],
         "stop_loss":      bot_state["stop_loss"],
+        "dca_enabled":    bot_state["dca_enabled"],
     }})
 
 
