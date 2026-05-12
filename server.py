@@ -744,6 +744,18 @@ def bot_loop():
     bot_log("⏹ Bot detenido.", "info")
 
 
+def _is_primary_worker():
+    """Verifica si este worker es el primario usando PostgreSQL."""
+    try:
+        conn = get_db()
+        rows = conn.run("SELECT pg_try_advisory_lock(99999)")
+        result = rows[0][0] if rows else False
+        conn.close()
+        return result
+    except:
+        return True  # si falla, asume que es primario
+
+
 # ─── Endpoints existentes ─────────────────────────────────────────────────────
 
 @app.route("/precios")
@@ -1074,18 +1086,9 @@ def _auto_start():
     global bot_thread, _bot_started
     if _bot_started:
         return
-    # Usar PostgreSQL advisory lock para garantizar una sola instancia
-    try:
-        conn = get_db()
-        # pg_try_advisory_lock retorna true solo si obtiene el lock
-        rows = conn.run("SELECT pg_try_advisory_lock(12345)")
-        got_lock = rows[0][0] if rows else False
-        conn.close()
-        if not got_lock:
-            logger.info("Bot ya corriendo en otro worker. Saltando.")
-            return
-    except Exception as e:
-        logger.error(f"Error advisory lock: {e}")
+    # Solo el worker primario arranca el bot
+    if not _is_primary_worker():
+        logger.info("Worker secundario — bot no arrancado.")
         return
     _bot_started = True
     init_db()
