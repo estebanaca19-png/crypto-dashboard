@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "cruztrd_webhook_2026")
 BOT_DIR        = "/opt/cruztrd"
 GITHUB_RAW     = "https://raw.githubusercontent.com/estebanaca19-png/crypto-dashboard/main/server.py"
+GITHUB_HTML    = "https://raw.githubusercontent.com/estebanaca19-png/crypto-dashboard/main/index.html"
 
 def verify_signature(payload, signature):
     """Verifica que el webhook viene de GitHub."""
@@ -46,7 +47,13 @@ def deploy():
             capture_output=True, text=True, timeout=30
         )
         if result.returncode != 0:
-            raise Exception(f"Error descargando: {result.stderr}")
+            raise Exception(f"Error descargando server.py: {result.stderr}")
+
+        # Descargar nuevo index.html
+        subprocess.run(
+            ["curl", "-o", f"{BOT_DIR}/index.html", GITHUB_HTML],
+            capture_output=True, text=True, timeout=30
+        )
 
         # Reiniciar el servicio
         result = subprocess.run(
