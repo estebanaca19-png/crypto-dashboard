@@ -1072,6 +1072,13 @@ def bot_config():
 # ─── Auto-arranque al cargar el módulo (compatible con gunicorn) ──────────────
 def _auto_start():
     global bot_thread, _bot_started
+    import fcntl
+    lock_file = open("/tmp/bot.lock", "w")
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except IOError:
+        logger.info("Bot ya está corriendo en otro worker. Saltando auto-start.")
+        return
     if _bot_started:
         return
     _bot_started = True
