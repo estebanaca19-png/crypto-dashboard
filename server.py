@@ -231,6 +231,53 @@ def get_openai_signal():
     update_openai_signal()
     return _openai_market_signal
 
+
+# ─── Fear & Greed Index ───────────────────────────────────────────────────────
+_fear_greed_cache = {"value": 50, "label": "Neutral", "ts": 0}
+FEAR_GREED_TTL    = 3600  # actualizar cada hora
+
+def get_fear_greed():
+    """
+    Obtiene el índice Fear & Greed de Alternative.me.
+    0-24: Extreme Fear (mejor momento para comprar)
+    25-49: Fear
+    50-74: Greed
+    75-100: Extreme Greed (mejor momento para vender)
+    """
+    global _fear_greed_cache
+    now = time.time()
+    if now - _fear_greed_cache.get("ts", 0) < FEAR_GREED_TTL:
+        return _fear_greed_cache
+
+    try:
+        resp = req_lib.get(
+            "https://api.alternative.me/fng/?limit=1",
+            timeout=5
+        )
+        if resp.status_code != 200:
+            return _fear_greed_cache
+
+        data  = resp.json().get("data", [{}])[0]
+        value = int(data.get("value", 50))
+        label = data.get("value_classification", "Neutral")
+
+        _fear_greed_cache = {
+            "value":        value,
+            "label":        label,
+            "ts":           now,
+            "extreme_fear": value < 25,
+            "fear":         25 <= value < 45,
+            "neutral":      45 <= value < 55,
+            "greed":        55 <= value < 75,
+            "extreme_greed": value >= 75,
+        }
+        logger.info(f"😱 Fear & Greed: {value} ({label})")
+        return _fear_greed_cache
+
+    except Exception as e:
+        logger.error(f"Error Fear & Greed: {e}")
+        return _fear_greed_cache
+
 def get_taapi_signal(symbol):
     """
     Obtiene señales ML de Taapi para un símbolo.
@@ -729,8 +776,11 @@ def bot_cycle():
 
     high_vol = is_high_volatility_hour()
 
-    # Actualizar señal OpenAI cada 10 minutos en background
+    # Actualizar señal OpenAI cada 30 minutos en background
     threading.Thread(target=update_openai_signal, daemon=True).start()
+
+    # Actualizar Fear & Greed cada hora en background
+    threading.Thread(target=get_fear_greed, daemon=True).start()
 
     for symbol in all_pairs:
         try:
@@ -790,6 +840,16 @@ def bot_cycle():
                 usdt_free >= t_amount * 0.4 and
                 not daily_goal_reached() and
                 check_max_investment(symbol, t_amount * 0.4)):
+
+                # ── Fear & Greed Index ───────────────────────────────────────
+                fg = get_fear_greed()
+                if fg.get("extreme_greed"):
+                    bot_log(f"😱 Fear&Greed rechaza {symbol} | mercado en euforia: {fg['value']} ({fg['label']})", "info")
+                    continue
+                elif fg.get("extreme_fear"):
+                    bot_log(f"✅ Fear&Greed EXCELENTE momento | {fg['value']} ({fg['label']}) — comprando", "buy")
+                else:
+                    bot_log(f"😐 Fear&Greed OK | {fg['value']} ({fg['label']})", "buy")
 
                 # ── Verificación ML con Taapi ────────────────────────────────
                 taapi_signal = get_taapi_signal(symbol)
@@ -1391,7 +1451,8 @@ def ml_signals():
             entry["cryptoquant"] = cryptoquant_cache[sym][0]
         if entry:
             signals[sym] = entry
-    signals["openai"] = _openai_market_signal
+    signals["openai"]      = _openai_market_signal
+    signals["fear_greed"]  = _fear_greed_cache
     return jsonify(signals)
 
 
