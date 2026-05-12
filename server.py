@@ -335,12 +335,23 @@ def init_db():
         logger.error(f"Error iniciando DB: {e}")
 
 def save_state():
-    """Guarda posiciones y stats en PostgreSQL."""
+    """Guarda posiciones, stats y configuración en PostgreSQL."""
     try:
         conn = get_db()
         data = json.dumps({
             "positions": bot_state["positions"],
             "stats":     bot_state["stats"],
+            "config": {
+                "profit_target":  bot_state["profit_target"],
+                "drop_to_buy":    bot_state["drop_to_buy"],
+                "trade_amount":   bot_state["trade_amount"],
+                "interval":       bot_state["interval"],
+                "stop_loss":      bot_state["stop_loss"],
+                "max_positions":  bot_state["max_positions"],
+                "dca_enabled":    bot_state["dca_enabled"],
+                "volatile_amount": bot_state["volatile_amount"],
+                "reinvest_pct":   bot_state.get("reinvest_pct", 80),
+            }
         })
         conn.run("""
             INSERT INTO bot_state (key, value) VALUES ('state', :data)
@@ -351,7 +362,7 @@ def save_state():
         logger.error(f"Error guardando estado en DB: {e}")
 
 def load_state():
-    """Carga posiciones y stats desde PostgreSQL al arrancar."""
+    """Carga posiciones, stats y configuración desde PostgreSQL al arrancar."""
     try:
         conn = get_db()
         rows = conn.run("SELECT value FROM bot_state WHERE key = 'state'")
@@ -360,7 +371,19 @@ def load_state():
             data = json.loads(rows[0][0])
             bot_state["positions"] = data.get("positions", {})
             bot_state["stats"]     = data.get("stats", bot_state["stats"])
-            logger.info(f"✓ Estado restaurado desde DB: {len(bot_state['positions'])} posiciones.")
+            # Restaurar configuración
+            cfg = data.get("config", {})
+            if cfg:
+                bot_state["profit_target"]  = cfg.get("profit_target",  bot_state["profit_target"])
+                bot_state["drop_to_buy"]    = cfg.get("drop_to_buy",    bot_state["drop_to_buy"])
+                bot_state["trade_amount"]   = cfg.get("trade_amount",   bot_state["trade_amount"])
+                bot_state["interval"]       = cfg.get("interval",       bot_state["interval"])
+                bot_state["stop_loss"]      = cfg.get("stop_loss",      bot_state["stop_loss"])
+                bot_state["max_positions"]  = cfg.get("max_positions",  bot_state["max_positions"])
+                bot_state["dca_enabled"]    = cfg.get("dca_enabled",    bot_state["dca_enabled"])
+                bot_state["volatile_amount"] = cfg.get("volatile_amount", bot_state["volatile_amount"])
+                bot_state["reinvest_pct"]   = cfg.get("reinvest_pct",   80)
+            logger.info(f"✓ Estado restaurado: {len(bot_state['positions'])} posiciones | DCA:{bot_state['dca_enabled']} | trade:${bot_state['trade_amount']}")
     except Exception as e:
         logger.error(f"Error cargando estado desde DB: {e}")
 
@@ -1504,6 +1527,7 @@ def bot_config():
         if "dca_enabled"    in data: bot_state["dca_enabled"]    = bool(data["dca_enabled"])
         if "volatile_amount" in data: bot_state["volatile_amount"] = float(data["volatile_amount"])
         if "reinvest_pct"   in data: bot_state["reinvest_pct"]   = int(data["reinvest_pct"])
+    save_state()  # persistir config en PostgreSQL
     return jsonify({"ok": True, "config": {
         "pairs":          bot_state["pairs"],
         "profit_target":  bot_state["profit_target"],
