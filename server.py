@@ -567,7 +567,20 @@ bot_state = {
     "reinvest_enabled": True,
     "reinvest_pct": 80,
     "total_reinvested": 0.0,
-    # ── Techo de inversión por moneda ─────────────────────────────────────────
+    # ── Trailing Stop ─────────────────────────────────────────────────────────
+    "trailing_stop_enabled": True,
+    "trailing_stop_pct":     0.5,   # si el precio baja 0.5% desde el máximo, vender
+    "price_highs":           {},    # precio máximo alcanzado por posición
+    # ── Profit target dinámico ────────────────────────────────────────────────
+    "dynamic_profit_enabled": True,
+    # ── Tamaño de posición dinámico según score ML ────────────────────────────
+    "dynamic_size_enabled":  True,
+    # ── Intervalo óptimo ─────────────────────────────────────────────────────
+    "interval":              45,    # 45 segundos
+    # ── Reentrada inteligente ─────────────────────────────────────────────────
+    "reentry_enabled":       True,
+    "reentry_drop":          0.8,   # compra si cae 0.8% después de una venta exitosa
+    "recent_sells":          {},    # {symbol: {"price": x, "time": t, "won": bool}}
     "max_investment": {
         "BTCUSDT":   100,
         "ETHUSDT":   100,
@@ -752,20 +765,63 @@ def check_daily_reset():
 def daily_goal_reached():
     """Verifica si se alcanzó la meta diaria."""
     return bot_state["stats"]["daily_pnl"] >= bot_state["stats"]["daily_goal"]
-    """Calcula el RSI de una lista de precios de cierre."""
-    if len(closes) < period + 1:
-        return 50
-    gains, losses = [], []
-    for i in range(1, len(closes)):
-        diff = closes[i] - closes[i-1]
-        gains.append(max(diff, 0))
-        losses.append(max(-diff, 0))
-    avg_gain = sum(gains[-period:]) / period
-    avg_loss = sum(losses[-period:]) / period
-    if avg_loss == 0:
-        return 100
-    rs = avg_gain / avg_loss
-    return round(100 - (100 / (1 + rs)), 1)
+
+
+def get_market_context(client, all_pairs):
+    """
+    Analiza el contexto general del mercado antes de cualquier compra.
+    Retorna un dict con señales macro del mercado.
+    """
+    try:
+        # 1. Tendencia de BTC en las últimas horas
+        btc_ticker = client.get_ticker(symbol="BTCUSDT")
+        btc_change_24h = float(btc_ticker["priceChangePercent"])
+        btc_price = float(btc_ticker["lastPrice"])
+
+        # 2. Calcular cuántos pares están cayendo vs subiendo
+        falling = 0
+        rising  = 0
+        for sym in all_pairs[:8]:  # muestra representativa
+            try:
+                t = client.get_ticker(symbol=sym)
+                chg = float(t["priceChangePercent"])
+                if chg < -1: falling += 1
+                elif chg > 1: rising += 1
+            except:
+                pass
+
+        total = falling + rising if (falling + rising) > 0 else 1
+        market_bearish_pct = (falling / total) * 100
+
+        # 3. Historial de pérdidas recientes del bot
+        stats = bot_state.get("stats", {})
+        recent_losses = stats.get("consecutive_losses", 0)
+
+        context = {
+            "btc_change_24h":      round(btc_change_24h, 2),
+            "btc_price":           btc_price,
+            "market_bearish_pct":  round(market_bearish_pct, 0),
+            "recent_losses":       recent_losses,
+            "market_crash":        btc_change_24h < -5,      # BTC cayó >5% hoy
+            "market_weak":         btc_change_24h < -2,      # BTC cayó >2% hoy
+            "market_strong":       btc_change_24h > 2,       # BTC subió >2%
+            "broad_selloff":       market_bearish_pct > 70,  # >70% pares cayendo
+            "on_losing_streak":    recent_losses >= 3,       # 3+ pérdidas seguidas
+        }
+        return context
+    except Exception as e:
+        logger.error(f"Error market context: {e}")
+        return {}
+
+
+def update_consecutive_losses(won):
+    """Actualiza el contador de pérdidas/ganancias consecutivas."""
+    with state_lock:
+        if won:
+            bot_state["stats"]["consecutive_losses"] = 0
+        else:
+            current = bot_state["stats"].get("consecutive_losses", 0)
+            bot_state["stats"]["consecutive_losses"] = current + 1
 
 
 def execute_sell(client, symbol, position, price, reason=""):
@@ -797,8 +853,10 @@ def execute_sell(client, symbol, position, price, reason=""):
             bot_state["stats"]["trades"]    += 1
             if earned >= 0:
                 bot_state["stats"]["wins"]   += 1
+                update_consecutive_losses(True)
             else:
                 bot_state["stats"]["losses"] += 1
+                update_consecutive_losses(False)
         save_state()
         if earned > 0:
             apply_reinvestment(earned)
@@ -850,6 +908,16 @@ def bot_cycle():
     # Actualizar Fear & Greed cada hora en background
     threading.Thread(target=get_fear_greed, daemon=True).start()
 
+    # Obtener contexto general del mercado
+    market_ctx = get_market_context(client, all_pairs)
+
+    # Veto global — si el mercado está en crash, no comprar nada
+    if market_ctx.get("market_crash"):
+        bot_log(f"🔴 VETO GLOBAL — BTC cayó {market_ctx['btc_change_24h']}% hoy. Sin nuevas compras.", "error")
+        # Solo gestionar posiciones existentes, no comprar
+    if market_ctx.get("broad_selloff"):
+        bot_log(f"🔴 SELLOFF GENERALIZADO — {market_ctx['market_bearish_pct']}% pares cayendo. Modo defensivo.", "error")
+
     for symbol in all_pairs:
         try:
             is_volatile = symbol in volatile_pairs
@@ -898,70 +966,171 @@ def bot_cycle():
             confirmed_drop = drops.get(symbol, 0) >= 2
 
             # ════════════════════════════════════════════════════════════════
-            # SEÑAL DE COMPRA INICIAL (primera entrada DCA)
+            # SEÑAL DE COMPRA — SISTEMA DE PUNTUACIÓN ML (0-100 pts)
             # ════════════════════════════════════════════════════════════════
             if (position is None and
                 prev_price and
                 confirmed_drop and
-                rsi < (55 if high_vol else 50) and
                 n_positions < max_positions and
                 usdt_free >= t_amount * 0.4 and
                 not daily_goal_reached() and
                 check_max_investment(symbol, t_amount * 0.4)):
 
-                # ── Fear & Greed Index ───────────────────────────────────────
-                fg = get_fear_greed()
-                if fg.get("extreme_greed"):
-                    bot_log(f"😱 Fear&Greed rechaza {symbol} | mercado en euforia: {fg['value']} ({fg['label']})", "info")
-                    continue
-                elif fg.get("extreme_fear"):
-                    bot_log(f"✅ Fear&Greed EXCELENTE momento | {fg['value']} ({fg['label']}) — comprando", "buy")
+                score   = 0
+                reasons = []
+                vetoes  = []
+
+                # ── VETO GLOBAL — contexto de mercado ────────────────────────
+                if market_ctx.get("market_crash"):
+                    vetoes.append(f"BTC crash:{market_ctx.get('btc_change_24h')}%")
+                if market_ctx.get("broad_selloff"):
+                    vetoes.append(f"Selloff:{market_ctx.get('market_bearish_pct')}% pares bajando")
+                if market_ctx.get("on_losing_streak"):
+                    vetoes.append(f"Racha perdedora:{market_ctx.get('recent_losses')} pérdidas seguidas")
+
+                # ── VETO — caída con volumen alto (trampa bajista) ────────────
+                if vol24h > 0:
+                    avg_vol = bot_state.get("avg_volumes", {}).get(symbol, vol24h)
+                    if real_change < -1.5 and vol24h > avg_vol * 2:
+                        vetoes.append(f"Caída con volumen 2x — trampa bajista")
+                # Guardar volumen promedio
+                avg_vols = bot_state.get("avg_volumes", {})
+                avg_vols[symbol] = (avg_vols.get(symbol, vol24h) * 0.9 + vol24h * 0.1)
+                bot_state["avg_volumes"] = avg_vols
+
+                # ── 1. RSI propio (0-20 pts) ──────────────────────────────────
+                if rsi < 25:
+                    score += 20; reasons.append(f"RSI:{rsi}(sobreventa extrema)")
+                elif rsi < 35:
+                    score += 15; reasons.append(f"RSI:{rsi}(sobreventa)")
+                elif rsi < 45:
+                    score += 10; reasons.append(f"RSI:{rsi}(bajo)")
+                elif rsi < 50:
+                    score += 5;  reasons.append(f"RSI:{rsi}(neutro-bajo)")
                 else:
-                    bot_log(f"😐 Fear&Greed OK | {fg['value']} ({fg['label']})", "buy")
+                    score += 0;  reasons.append(f"RSI:{rsi}(alto)")
+                    if rsi > 60:
+                        vetoes.append(f"RSI alto:{rsi} — no es buen momento")
 
-                # ── Verificación ML con Taapi ────────────────────────────────
+                # ── 2. Fear & Greed (0-25 pts) ────────────────────────────────
+                fg = get_fear_greed()
+                fg_val = fg.get("value", 50)
+                if fg.get("extreme_greed"):
+                    vetoes.append(f"Fear&Greed euforia extrema:{fg_val}")
+                elif fg.get("extreme_fear"):
+                    score += 25; reasons.append(f"F&G:{fg_val}(miedo extremo=oportunidad)")
+                elif fg.get("fear"):
+                    score += 15; reasons.append(f"F&G:{fg_val}(miedo)")
+                elif fg.get("neutral"):
+                    score += 8;  reasons.append(f"F&G:{fg_val}(neutro)")
+                elif fg.get("greed"):
+                    score += 3;  reasons.append(f"F&G:{fg_val}(codicia)")
+
+                # ── 3. Taapi ML (0-25 pts) ────────────────────────────────────
                 taapi_signal = get_taapi_signal(symbol)
-                if taapi_signal:
-                    buy_score = taapi_signal.get("buy_score", 0)
-                    if buy_score < 2:
-                        bot_log(f"🤖 ML rechaza {symbol} | score:{buy_score}/3 | RSI:{taapi_signal['rsi']}", "info")
-                        continue
-                    bot_log(f"🤖 ML aprueba {symbol} | score:{buy_score}/3 | RSI:{taapi_signal['rsi']}", "buy")
+                if taapi_signal and taapi_signal.get("ok"):
+                    ts  = taapi_signal.get("buy_score", 0)
+                    pts = [0, 8, 17, 25][min(ts, 3)]
+                    score += pts; reasons.append(f"Taapi:{ts}/3")
+                    if taapi_signal.get("rsi", 50) > 70:
+                        vetoes.append(f"Taapi RSI sobrecomprado:{taapi_signal['rsi']}")
+                else:
+                    score += 8  # neutral
 
-                # ── Verificación de sentimiento con Santiment ─────────────────
+                # ── 4. Santiment (0-10 pts) ───────────────────────────────────
                 sentiment = get_santiment_sentiment(symbol)
-                if sentiment and sentiment["negative"]:
-                    bot_log(f"📉 Santiment rechaza {symbol} | score:{sentiment['score']}", "info")
-                    continue
-                elif sentiment:
-                    bot_log(f"📊 Santiment OK {symbol} | score:{sentiment['score']}", "buy")
+                if sentiment:
+                    if sentiment["negative"]:
+                        vetoes.append(f"Santiment negativo:{sentiment['score']}")
+                    elif sentiment["positive"]:
+                        score += 10; reasons.append(f"Sentimiento:positivo")
+                    else:
+                        score += 5;  reasons.append(f"Sentimiento:neutro")
+                else:
+                    score += 5
 
-                # ── CoinGlass — Liquidaciones ─────────────────────────────────
-                cg_liq = get_coinglass_signal(symbol)
-                if cg_liq and cg_liq["bearish"]:
-                    bot_log(f"💧 CoinGlass rechaza {symbol} | longs liquidados: ${cg_liq['long_liq']:,.0f}", "info")
-                    continue
-                elif cg_liq and cg_liq["bullish"]:
-                    bot_log(f"💧 CoinGlass OK {symbol} | shorts liquidados (rebote): ${cg_liq['short_liq']:,.0f}", "buy")
+                # ── 5. CryptoQuant (0-10 pts) ─────────────────────────────────
+                cq = get_cryptoquant_signal(symbol)
+                if cq:
+                    if cq["bearish"]:
+                        vetoes.append(f"CryptoQuant bearish")
+                    elif cq["bullish"]:
+                        score += 10; reasons.append(f"CryptoQuant:bullish")
+                    else:
+                        score += 5;  reasons.append(f"CryptoQuant:neutro")
+                else:
+                    score += 5
 
-                # ── Verificación on-chain con CryptoQuant (solo BTC/ETH) ──────
-                cq_signal = get_cryptoquant_signal(symbol)
-                if cq_signal and cq_signal["bearish"]:
-                    bot_log(f"🐋 CryptoQuant rechaza {symbol} | flujo exchanges: {cq_signal['avg_netflow']:.0f}", "info")
-                    continue
-                elif cq_signal:
-                    bot_log(f"🐋 CryptoQuant OK {symbol} | {cq_signal['signal']} | netflow:{cq_signal['avg_netflow']:.0f}", "buy")
+                # ── 6. CoinGlass liquidaciones (-5 a +5 pts) ─────────────────
+                cg = get_coinglass_signal(symbol)
+                if cg:
+                    if cg["bearish"]:
+                        score -= 5; reasons.append(f"CoinGlass:longs liquidados")
+                    elif cg["bullish"]:
+                        score += 5; reasons.append(f"CoinGlass:rebote")
 
-                # ── Verificación de sentimiento general con OpenAI ────────────
-                ai_signal = get_openai_signal()
-                if ai_signal.get("signal") == "sell" and ai_signal.get("confidence", 0) > 70:
-                    bot_log(f"🧠 OpenAI rechaza compra | {ai_signal.get('reason','')}", "info")
-                    continue
-                elif ai_signal.get("signal") == "buy":
-                    bot_log(f"🧠 OpenAI aprueba | {ai_signal.get('reason','')} | conf:{ai_signal.get('confidence',0)}%", "buy")
+                # ── 7. OpenAI (0-5 pts) ───────────────────────────────────────
+                ai = get_openai_signal()
+                if ai.get("signal") == "sell" and ai.get("confidence", 0) > 80:
+                    vetoes.append(f"OpenAI sell:{ai.get('confidence')}%")
+                elif ai.get("signal") == "buy":
+                    score += 5; reasons.append(f"OpenAI:buy({ai.get('confidence',0)}%)")
+                else:
+                    score += 2
 
-                # Primera entrada DCA: usa 40% del capital
-                first_amount = t_amount * 0.4
+                # ── 8. Bonus por contexto positivo ───────────────────────────
+                if market_ctx.get("market_strong"):
+                    score += 5; reasons.append("BTC tendencia alcista")
+                if market_ctx.get("btc_change_24h", 0) > 0 and not is_volatile:
+                    score += 3; reasons.append("BTC en verde")
+
+                # ── Umbral dinámico según condiciones ────────────────────────
+                min_score = 50  # base
+                if is_volatile:           min_score += 10  # volátiles requieren más
+                if market_ctx.get("market_weak"): min_score += 10  # mercado débil = más exigente
+                if market_ctx.get("on_losing_streak"): min_score += 15  # racha mala = más exigente
+
+                # ── Evaluación final ──────────────────────────────────────────
+                if vetoes:
+                    bot_log(f"🚫 VETO {symbol} | score:{score} | {' | '.join(vetoes)}", "info")
+                    continue
+
+                if score < min_score:
+                    bot_log(f"⏸ Sin señal {symbol} | score:{score}/{min_score} | {' · '.join(reasons[:3])}", "info")
+                    continue
+
+                bot_log(f"✅ COMPRA APROBADA {symbol} | score:{score}/{min_score} | {' · '.join(reasons)}", "buy")
+
+                # ── Tamaño dinámico según score ML ───────────────────────────
+                if bot_state.get("dynamic_size_enabled", True):
+                    if score >= 80:     size_mult = 1.5   # señal muy fuerte
+                    elif score >= 65:   size_mult = 1.2   # señal fuerte
+                    elif score >= 55:   size_mult = 1.0   # señal normal
+                    else:               size_mult = 0.7   # señal débil = menos capital
+                else:
+                    size_mult = 1.0
+
+                # ── Horario óptimo de trading (13-21 UTC) ────────────────────
+                hour = time.gmtime().tm_hour
+                if 13 <= hour <= 21:
+                    size_mult = min(size_mult * 1.1, 2.0)  # +10% en horario pico
+                    drop_effective = drop_to_buy * 0.7     # umbral más bajo en horario pico
+                else:
+                    drop_effective = drop_to_buy
+
+                # ── Reentrada inteligente ─────────────────────────────────────
+                recent_sell = bot_state.get("recent_sells", {}).get(symbol)
+                reentry_mult = 1.0
+                if recent_sell and recent_sell.get("won") and bot_state.get("reentry_enabled", True):
+                    time_since = time.time() - recent_sell.get("time", 0)
+                    if time_since < 3600:  # dentro de 1 hora
+                        reentry_drop = (recent_sell["price"] - price) / recent_sell["price"]
+                        if reentry_drop >= bot_state.get("reentry_drop", 0.8) / 100:
+                            reentry_mult = 1.3  # más capital en reentrada exitosa
+                            bot_log(f"🔄 REENTRADA {symbol} | caída desde venta: {reentry_drop*100:.2f}%", "buy")
+
+                final_amount = t_amount * size_mult * reentry_mult
+                first_amount = min(final_amount * 0.4, usdt_free * 0.9)  # máximo 90% del USDT libre
                 qty  = calc_qty(symbol, price, first_amount)
                 step = get_step_size(client, symbol)
                 qty  = round_step(qty, step)
@@ -1040,20 +1209,53 @@ def bot_cycle():
             # GESTIÓN DE POSICIÓN ABIERTA
             # ════════════════════════════════════════════════════════════════
             elif position is not None:
-                buy_price   = position["buy_price"]
-                qty         = position["qty"]
-                pnl_pct     = (price - buy_price) / buy_price
+                buy_price    = position.get("avg_price", position["buy_price"])
+                qty          = position["qty"]
+                pnl_pct      = (price - buy_price) / buy_price
                 pos_volatile = position.get("is_volatile", False)
-                p_target    = volatile_profit if pos_volatile else profit_target
-                sl          = volatile_stop_loss if pos_volatile else stop_loss
+                sl           = volatile_stop_loss if pos_volatile else stop_loss
+
+                # ── Profit target dinámico según Fear & Greed ────────────────
+                fg_val = get_fear_greed().get("value", 50)
+                base_target = volatile_profit if pos_volatile else profit_target
+                if bot_state.get("dynamic_profit_enabled", True):
+                    if fg_val >= 75:   p_target = base_target * 3.0
+                    elif fg_val >= 60: p_target = base_target * 2.0
+                    elif fg_val >= 45: p_target = base_target
+                    else:              p_target = base_target * 0.8
+                else:
+                    p_target = base_target
+
+                # ── Trailing Stop ─────────────────────────────────────────────
+                if bot_state.get("trailing_stop_enabled", True):
+                    price_highs  = bot_state.get("price_highs", {})
+                    current_high = price_highs.get(symbol, buy_price)
+                    if price > current_high:
+                        price_highs[symbol] = price
+                        bot_state["price_highs"] = price_highs
+                        current_high = price
+                    trail_pct  = bot_state.get("trailing_stop_pct", 0.5) / 100
+                    trail_drop = (current_high - price) / current_high if current_high > 0 else 0
+                    if trail_drop >= trail_pct and pnl_pct > 0.003:
+                        bot_log(f"📉 TRAILING STOP {symbol} | máx:${current_high:.4f} caída:{trail_drop*100:.2f}% P&L:{pnl_pct*100:.2f}%", "sell")
+                        if execute_sell(client, symbol, position, price, reason="trailing-stop"):
+                            with state_lock:
+                                bot_state["stats"]["daily_pnl"] += (price - buy_price) * qty
+                                bot_state["recent_sells"][symbol] = {"price": price, "time": time.time(), "won": True}
+                                ph = bot_state.get("price_highs", {})
+                                if symbol in ph: del ph[symbol]
+                        continue
 
                 # 🛑 STOP-LOSS
                 if pnl_pct <= -sl:
                     bot_log(f"🛑 STOP-LOSS {symbol} @ ${price:.4f} | {pnl_pct*100:.2f}%", "error")
                     if execute_sell(client, symbol, position, price, reason="stop-loss"):
-                        add_to_blacklist(symbol, blacklist_hours * 2)  # doble blacklist tras stop-loss
+                        add_to_blacklist(symbol, blacklist_hours * 2)
                         with state_lock:
                             bot_state["stats"]["daily_pnl"] += (price - buy_price) * qty
+                            bot_state["recent_sells"][symbol] = {"price": price, "time": time.time(), "won": False}
+                            ph = bot_state.get("price_highs", {})
+                            if symbol in ph: del ph[symbol]
 
                 # ✅ VENTA PARCIAL al llegar a profit_target
                 elif pnl_pct >= p_target and not position.get("partial_sold"):
@@ -1073,8 +1275,9 @@ def bot_cycle():
                                 bot_state["stats"]["daily_pnl"]  += earned
                                 bot_state["stats"]["trades"]     += 1
                                 bot_state["stats"]["wins"]       += 1
+                                update_consecutive_losses(True)
                             save_state()
-                            bot_log(f"½ SELL 50% {symbol} @ ${fill_price:.4f} | +${earned:.2f} | meta día: ${bot_state['stats']['daily_pnl']:.2f}/${bot_state['stats']['daily_goal']:.2f}", "sell")
+                            bot_log(f"½ SELL 50% {symbol} @ ${fill_price:.4f} | +${earned:.2f} | F&G:{fg_val} | día:${bot_state['stats']['daily_pnl']:.2f}/${bot_state['stats']['daily_goal']:.2f}", "sell")
                     except Exception as e:
                         bot_log(f"✗ Error venta parcial {symbol}: {e}", "error")
 
@@ -1084,15 +1287,19 @@ def bot_cycle():
                         earned = (price - buy_price) * qty
                         with state_lock:
                             bot_state["stats"]["daily_pnl"] += earned
+                            bot_state["recent_sells"][symbol] = {"price": price, "time": time.time(), "won": True}
+                            ph = bot_state.get("price_highs", {})
+                            if symbol in ph: del ph[symbol]
                         if daily_goal_reached():
-                            bot_log(f"🎯 META DIARIA ALCANZADA: ${bot_state['stats']['daily_pnl']:.2f} — el bot seguirá vendiendo pero pausará nuevas compras", "buy")
+                            bot_log(f"🎯 META DIARIA: ${bot_state['stats']['daily_pnl']:.2f}", "buy")
 
                 else:
-                    goal     = bot_state["stats"]["daily_goal"]
-                    daily    = bot_state["stats"]["daily_pnl"]
-                    sl_dist  = (pnl_pct + sl) / sl * 100
-                    tag      = "🔥" if pos_volatile else "◷"
-                    bot_log(f"{tag} HOLD {symbol} @ ${price:.4f} | P&L:{pnl_pct*100:.2f}% | RSI:{rsi} | SL:{sl_dist:.0f}% | día:${daily:.2f}/${goal:.2f}", "info")
+                    goal    = bot_state["stats"]["daily_goal"]
+                    daily   = bot_state["stats"]["daily_pnl"]
+                    sl_dist = (pnl_pct + sl) / sl * 100
+                    tag     = "🔥" if pos_volatile else "◷"
+                    ph      = bot_state.get("price_highs", {}).get(symbol, buy_price)
+                    bot_log(f"{tag} HOLD {symbol} @ ${price:.4f} | P&L:{pnl_pct*100:.2f}% | RSI:{rsi} | SL:{sl_dist:.0f}% | máx:${ph:.4f}", "info")
 
         except Exception as e:
             bot_log(f"✗ Error ciclo {symbol}: {e}", "error")
@@ -1705,4 +1912,3 @@ if __name__ == "__main__":
     bot_thread.start()
     logger.info("🚀 Servidor iniciado — bot arrancado automáticamente.")
     app.run(host="0.0.0.0", port=port, debug=False)
-    # update test
