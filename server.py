@@ -140,9 +140,10 @@ bot_state = {
     "total_reinvested": 0.0,
 }
 
-bot_thread = None
-bot_lock   = threading.Lock()
-state_lock = threading.Lock()  # lock ligero solo para modificar posiciones
+bot_thread    = None
+bot_lock      = threading.Lock()
+state_lock    = threading.Lock()
+_bot_started  = False  # flag para evitar múltiples instancias
 
 
 def bot_log(msg, level="info"):
@@ -480,8 +481,7 @@ def bot_cycle():
 
                 dca_levels  = bot_state.get("dca_levels", [])
                 dca_entries = position.get("dca_entries", [])
-                n_entries   = len(dca_entries)
-                avg_price   = position.get("avg_price", position["buy_price"])
+                n_entries   = len(dca_entries)                avg_price   = position.get("avg_price", position["buy_price"])
 
                 if n_entries < len(dca_levels):
                     level         = dca_levels[n_entries]
@@ -502,9 +502,11 @@ def bot_cycle():
                             total_cost  = position["cost"] + costo
                             new_avg     = total_cost / total_qty
                             with state_lock:
-                                bot_state["positions"][symbol]["qty"]     = total_qty
-                                bot_state["positions"][symbol]["cost"]    = total_cost
+                                bot_state["positions"][symbol]["qty"]      = total_qty
+                                bot_state["positions"][symbol]["cost"]     = total_cost
                                 bot_state["positions"][symbol]["avg_price"] = new_avg
+                                if "dca_entries" not in bot_state["positions"][symbol]:
+                                    bot_state["positions"][symbol]["dca_entries"] = []
                                 bot_state["positions"][symbol]["dca_entries"].append(
                                     {"price": fill_price, "qty": qty, "cost": costo}
                                 )
@@ -1068,13 +1070,13 @@ def bot_config():
 
 # ─── Auto-arranque al cargar el módulo (compatible con gunicorn) ──────────────
 def _auto_start():
-    global bot_thread
+    global bot_thread, _bot_started
+    if _bot_started:
+        return
+    _bot_started = True
     init_db()
     load_state()
-    with state_lock:
-        if bot_state["running"]:
-            return  # ya hay una instancia corriendo
-        bot_state["running"] = True
+    bot_state["running"] = True
     bot_thread = threading.Thread(target=bot_loop, daemon=True)
     bot_thread.start()
     logger.info("🚀 Bot arrancado automáticamente al iniciar el servidor.")
