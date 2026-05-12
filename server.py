@@ -2258,7 +2258,6 @@ def _auto_start():
     global bot_thread, _bot_started
     if _bot_started:
         return
-    # Solo el worker primario arranca el bot
     if not _is_primary_worker():
         logger.info("Worker secundario — bot no arrancado.")
         return
@@ -2268,7 +2267,15 @@ def _auto_start():
     bot_state["running"] = True
     bot_thread = threading.Thread(target=bot_loop, daemon=True)
     bot_thread.start()
-    logger.info("🚀 Bot arrancado automáticamente al iniciar el servidor.")
+    logger.info("🚀 Bot spot arrancado automáticamente.")
+
+    # Auto-arranque de futuros si estaba activo
+    if futures_state.get("auto_start", True):
+        global futures_thread
+        futures_state["enabled"] = True
+        futures_thread = threading.Thread(target=futures_loop, daemon=True)
+        futures_thread.start()
+        logger.info("🚀 Bot de futuros arrancado automáticamente.")
 
 _auto_start()
 
