@@ -147,7 +147,7 @@ state_lock = threading.Lock()  # lock ligero solo para modificar posiciones
 
 def bot_log(msg, level="info"):
     entry = {"time": time.strftime("%H:%M:%S"), "msg": msg, "level": level}
-    with bot_lock:
+    with state_lock:
         bot_state["log"].append(entry)
         if len(bot_state["log"]) > 200:
             bot_state["log"] = bot_state["log"][-200:]
@@ -220,7 +220,7 @@ def apply_reinvestment(earned):
     reinvest_amt = earned * reinvest_pct
     if reinvest_amt <= 0:
         return
-    with bot_lock:
+    with state_lock:
         old_amount = bot_state["trade_amount"]
         # Aumentar capital por trade gradualmente (máximo $200)
         new_amount = min(old_amount + reinvest_amt, 200)
@@ -273,14 +273,14 @@ def is_blacklisted(symbol):
 
 def add_to_blacklist(symbol, hours=4):
     """Agrega un símbolo a la blacklist por N horas."""
-    with bot_lock:
+    with state_lock:
         bot_state["blacklist"][symbol] = time.time() + (hours * 3600)
     bot_log(f"🚫 BLACKLIST {symbol} por {hours}h — tendencia bajista detectada", "error")
 
 def check_daily_reset():
     """Resetea el P&L diario si es un nuevo día."""
     today = time.strftime("%Y-%m-%d")
-    with bot_lock:
+    with state_lock:
         if bot_state["stats"].get("last_reset", "") != today:
             bot_state["stats"]["daily_pnl"]   = 0.0
             bot_state["stats"]["last_reset"]  = today
@@ -329,7 +329,7 @@ def execute_sell(client, symbol, position, price, reason=""):
         order      = client.create_order(symbol=symbol, side=SIDE_SELL, type=ORDER_TYPE_MARKET, quantity=sell_qty)
         fill_price = float(order["fills"][0]["price"]) if order.get("fills") else price
         earned     = (fill_price - buy_price) * sell_qty
-        with bot_lock:
+        with state_lock:
             del bot_state["positions"][symbol]
             bot_state["stats"]["total_pnl"] += earned
             bot_state["stats"]["trades"]    += 1
@@ -355,7 +355,7 @@ def bot_cycle():
     # Reset diario
     check_daily_reset()
 
-    with bot_lock:
+    with state_lock:
         pairs              = list(bot_state["pairs"])
         volatile_pairs     = list(bot_state["volatile_pairs"])
         profit_target      = bot_state["profit_target"] / 100
@@ -374,7 +374,7 @@ def bot_cycle():
     try:
         account   = client.get_account()
         usdt_free = next((float(b["free"]) for b in account["balances"] if b["asset"] == "USDT"), 0.0)
-        with bot_lock:
+        with state_lock:
             bot_state["usdt_available"] = usdt_free
     except Exception as e:
         bot_log(f"✗ Error obteniendo balance: {e}", "error")
@@ -404,7 +404,7 @@ def bot_cycle():
             if is_blacklisted(symbol):
                 continue
 
-            with bot_lock:
+            with state_lock:
                 history     = bot_state["price_history"].get(symbol, [])
                 history.append(price)
                 if len(history) > 20:
@@ -425,7 +425,7 @@ def bot_cycle():
                 drops[symbol] = drops.get(symbol, 0) + 1
             else:
                 drops[symbol] = 0
-            with bot_lock:
+            with state_lock:
                 bot_state["consecutive_drops"] = drops
             confirmed_drop = drops.get(symbol, 0) >= 2
 
@@ -451,7 +451,7 @@ def bot_cycle():
                     costo      = fill_price * qty
                     usdt_free -= costo
                     tag        = "🔥VOLATILE" if is_volatile else "estable"
-                    with bot_lock:
+                    with state_lock:
                         bot_state["positions"][symbol] = {
                             "buy_price":    fill_price,
                             "qty":          qty,
@@ -501,7 +501,7 @@ def bot_cycle():
                             total_qty   = position["qty"] + qty
                             total_cost  = position["cost"] + costo
                             new_avg     = total_cost / total_qty
-                            with bot_lock:
+                            with state_lock:
                                 bot_state["positions"][symbol]["qty"]     = total_qty
                                 bot_state["positions"][symbol]["cost"]    = total_cost
                                 bot_state["positions"][symbol]["avg_price"] = new_avg
@@ -530,7 +530,7 @@ def bot_cycle():
                     bot_log(f"🛑 STOP-LOSS {symbol} @ ${price:.4f} | {pnl_pct*100:.2f}%", "error")
                     if execute_sell(client, symbol, position, price, reason="stop-loss"):
                         add_to_blacklist(symbol, blacklist_hours * 2)  # doble blacklist tras stop-loss
-                        with bot_lock:
+                        with state_lock:
                             bot_state["stats"]["daily_pnl"] += (price - buy_price) * qty
 
                 # ✅ VENTA PARCIAL al llegar a profit_target
@@ -544,7 +544,7 @@ def bot_cycle():
                             order      = client.create_order(symbol=symbol, side=SIDE_SELL, type=ORDER_TYPE_MARKET, quantity=half_qty)
                             fill_price = float(order["fills"][0]["price"]) if order.get("fills") else price
                             earned     = (fill_price - buy_price) * half_qty
-                            with bot_lock:
+                            with state_lock:
                                 bot_state["positions"][symbol]["partial_sold"] = True
                                 bot_state["positions"][symbol]["qty"]          = real_qty - half_qty
                                 bot_state["stats"]["total_pnl"]  += earned
@@ -560,7 +560,7 @@ def bot_cycle():
                 elif pnl_pct >= p_target * 2 and position.get("partial_sold"):
                     if execute_sell(client, symbol, position, price, reason="profit"):
                         earned = (price - buy_price) * qty
-                        with bot_lock:
+                        with state_lock:
                             bot_state["stats"]["daily_pnl"] += earned
                         if daily_goal_reached():
                             bot_log(f"🎯 META DIARIA ALCANZADA: ${bot_state['stats']['daily_pnl']:.2f} — el bot seguirá vendiendo pero pausará nuevas compras", "buy")
@@ -575,14 +575,14 @@ def bot_cycle():
         except Exception as e:
             bot_log(f"✗ Error ciclo {symbol}: {e}", "error")
 
-    with bot_lock:
+    with state_lock:
         bot_state["stats"]["cycles"] += 1
 
     # ── Balance USDT disponible ───────────────────────────────────────────────
     try:
         account   = client.get_account()
         usdt_free = next((float(b["free"]) for b in account["balances"] if b["asset"] == "USDT"), 0.0)
-        with bot_lock:
+        with state_lock:
             bot_state["usdt_available"] = usdt_free
     except Exception as e:
         bot_log(f"✗ Error obteniendo balance: {e}", "error")
@@ -596,7 +596,7 @@ def bot_cycle():
             price  = float(ticker["lastPrice"])
             vol24h = float(ticker["quoteVolume"])
 
-            with bot_lock:
+            with state_lock:
                 # Historial de precios para confirmar tendencia
                 history = bot_state["price_history"].get(symbol, [])
                 history.append(price)
@@ -616,7 +616,7 @@ def bot_cycle():
 
             # ── Volumen promedio (últimas 20 velas) ───────────────────────────
             vol_avg = bot_state.get("vol_avg", {}).get(symbol, vol24h)
-            with bot_lock:
+            with state_lock:
                 if "vol_avg" not in bot_state:
                     bot_state["vol_avg"] = {}
                 bot_state["vol_avg"][symbol] = vol24h * 0.1 + vol_avg * 0.9  # EMA suave
@@ -627,7 +627,7 @@ def bot_cycle():
                 drops[symbol] = drops.get(symbol, 0) + 1
             else:
                 drops[symbol] = 0
-            with bot_lock:
+            with state_lock:
                 bot_state["consecutive_drops"] = drops
             confirmed_drop = drops.get(symbol, 0) >= 2  # 2 ciclos consecutivos bajando
 
@@ -654,7 +654,7 @@ def bot_cycle():
                         fill_price = float(order["fills"][0]["price"]) if order.get("fills") else price
                         costo      = fill_price * qty
                         usdt_free -= costo
-                        with bot_lock:
+                        with state_lock:
                             bot_state["positions"][symbol] = {
                                 "buy_price": fill_price,
                                 "qty":       qty,
@@ -695,7 +695,7 @@ def bot_cycle():
                             order      = client.create_order(symbol=symbol, side=SIDE_SELL, type=ORDER_TYPE_MARKET, quantity=half_qty)
                             fill_price = float(order["fills"][0]["price"]) if order.get("fills") else price
                             earned     = (fill_price - buy_price) * half_qty
-                            with bot_lock:
+                            with state_lock:
                                 bot_state["positions"][symbol]["partial_sold"] = True
                                 bot_state["positions"][symbol]["qty"]          = real_qty - half_qty
                                 bot_state["stats"]["total_pnl"] += earned
@@ -721,14 +721,14 @@ def bot_cycle():
         except Exception as e:
             bot_log(f"✗ Error ciclo {symbol}: {e}", "error")
 
-    with bot_lock:
+    with state_lock:
         bot_state["stats"]["cycles"] += 1
 
 
 def bot_loop():
     bot_log("▶ Bot iniciado. Operando 24/7.", "info")
     while True:
-        with bot_lock:
+        with state_lock:
             running  = bot_state["running"]
             interval = bot_state["interval"]
         if not running:
@@ -983,7 +983,7 @@ def bot_start():
     global bot_thread
     data = request.get_json(silent=True) or {}
 
-    with bot_lock:
+    with state_lock:
         if bot_state["running"]:
             return jsonify({"ok": False, "msg": "Bot ya está corriendo"}), 400
         if "pairs"          in data: bot_state["pairs"]          = data["pairs"]
@@ -1047,7 +1047,7 @@ def bot_status():
 @app.route("/bot/config", methods=["POST"])
 def bot_config():
     data = request.get_json(silent=True) or {}
-    with bot_lock:
+    with state_lock:
         if "pairs"          in data: bot_state["pairs"]          = data["pairs"]
         if "profit_target"  in data: bot_state["profit_target"]  = float(data["profit_target"])
         if "drop_to_buy"    in data: bot_state["drop_to_buy"]    = float(data["drop_to_buy"])
@@ -1071,7 +1071,7 @@ def _auto_start():
     global bot_thread
     init_db()
     load_state()
-    with bot_lock:
+    with state_lock:
         if bot_state["running"]:
             return  # ya hay una instancia corriendo
         bot_state["running"] = True
