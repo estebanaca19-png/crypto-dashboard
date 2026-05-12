@@ -278,6 +278,74 @@ def get_fear_greed():
         logger.error(f"Error Fear & Greed: {e}")
         return _fear_greed_cache
 
+
+# ─── CoinGlass — Liquidaciones y Open Interest ───────────────────────────────
+_coinglass_cache = {}
+COINGLASS_TTL    = 300  # 5 minutos
+
+def get_coinglass_signal(symbol):
+    """
+    Obtiene datos de liquidaciones y open interest de CoinGlass.
+    Liquidaciones altas = volatilidad = oportunidad de rebote.
+    """
+    asset_map = {
+        "BTCUSDT": "BTC", "ETHUSDT": "ETH", "SOLUSDT": "SOL",
+        "BNBUSDT": "BNB", "XRPUSDT": "XRP", "ADAUSDT": "ADA",
+        "DOGEUSDT": "DOGE", "DOTUSDT": "DOT", "AVAXUSDT": "AVAX",
+        "LINKUSDT": "LINK", "LTCUSDT": "LTC", "MATICUSDT": "MATIC",
+    }
+    asset = asset_map.get(symbol)
+    if not asset:
+        return None
+
+    now = time.time()
+    if symbol in _coinglass_cache:
+        data, ts = _coinglass_cache[symbol]
+        if now - ts < COINGLASS_TTL:
+            return data
+
+    try:
+        # Liquidaciones en las últimas 24h
+        resp = req_lib.get(
+            f"https://open-api.coinglass.com/public/v2/liquidation_chart",
+            params={"symbol": asset, "interval": "1h", "limit": 4},
+            headers={"coinglassSecret": ""},
+            timeout=6
+        )
+        if resp.status_code != 200:
+            return None
+
+        data_raw = resp.json().get("data", [])
+        if not data_raw:
+            return None
+
+        # Calcular liquidaciones totales recientes
+        long_liq  = sum(d.get("longLiquidationUsd", 0) for d in data_raw)
+        short_liq = sum(d.get("shortLiquidationUsd", 0) for d in data_raw)
+        total_liq = long_liq + short_liq
+
+        # Si hay muchas liquidaciones de longs = presión bajista
+        # Si hay muchas liquidaciones de shorts = rebote alcista
+        long_dominant  = long_liq > short_liq * 1.5
+        short_dominant = short_liq > long_liq * 1.5
+
+        result = {
+            "asset":          asset,
+            "long_liq":       round(long_liq, 0),
+            "short_liq":      round(short_liq, 0),
+            "total_liq":      round(total_liq, 0),
+            "long_dominant":  long_dominant,
+            "short_dominant": short_dominant,
+            "bullish":        short_dominant,  # shorts liquidados = rebote
+            "bearish":        long_dominant,   # longs liquidados = caída
+        }
+        _coinglass_cache[symbol] = (result, now)
+        return result
+
+    except Exception as e:
+        logger.error(f"Error CoinGlass {symbol}: {e}")
+        return None
+
 def get_taapi_signal(symbol):
     """
     Obtiene señales ML de Taapi para un símbolo.
@@ -867,6 +935,14 @@ def bot_cycle():
                     continue
                 elif sentiment:
                     bot_log(f"📊 Santiment OK {symbol} | score:{sentiment['score']}", "buy")
+
+                # ── CoinGlass — Liquidaciones ─────────────────────────────────
+                cg_liq = get_coinglass_signal(symbol)
+                if cg_liq and cg_liq["bearish"]:
+                    bot_log(f"💧 CoinGlass rechaza {symbol} | longs liquidados: ${cg_liq['long_liq']:,.0f}", "info")
+                    continue
+                elif cg_liq and cg_liq["bullish"]:
+                    bot_log(f"💧 CoinGlass OK {symbol} | shorts liquidados (rebote): ${cg_liq['short_liq']:,.0f}", "buy")
 
                 # ── Verificación on-chain con CryptoQuant (solo BTC/ETH) ──────
                 cq_signal = get_cryptoquant_signal(symbol)
