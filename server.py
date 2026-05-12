@@ -12,20 +12,22 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger(__name__)
 
 API_KEY      = os.environ.get("API_KEY")
-SECRET_KEY   = os.environ.get("SECRET_KEY")
-DATABASE_URL = os.environ.get("DATABASE_URL")
-TAAPI_SECRET    = os.environ.get("TAAPI_SECRET", "")
-SANTIMENT_KEY   = os.environ.get("SANTIMENT_KEY", "")
-GLASSNODE_KEY   = os.environ.get("GLASSNODE_KEY", "")
-OPENAI_KEY      = os.environ.get("OPENAI_KEY", "")
+SECRET_KEY        = os.environ.get("SECRET_KEY")
+DATABASE_URL      = os.environ.get("DATABASE_URL")
+TAAPI_SECRET      = os.environ.get("TAAPI_SECRET", "")
+SANTIMENT_KEY     = os.environ.get("SANTIMENT_KEY", "")
+CRYPTOQUANT_KEY   = os.environ.get("CRYPTOQUANT_KEY", "")
+OPENAI_KEY        = os.environ.get("OPENAI_KEY", "")
 
 # ─── Cache de señales externas ────────────────────────────────────────────────
-taapi_cache     = {}
-santiment_cache = {}
-glassnode_cache = {}
-TAAPI_TTL       = 30   # segundos
-SANTIMENT_TTL   = 300  # 5 minutos
-GLASSNODE_TTL   = 300  # 5 minutos
+taapi_cache       = {}
+santiment_cache   = {}
+cryptoquant_cache = {}
+openai_cache      = {}
+TAAPI_TTL         = 30    # segundos
+SANTIMENT_TTL     = 300   # 5 minutos
+CRYPTOQUANT_TTL   = 300   # 5 minutos
+OPENAI_TTL        = 600   # 10 minutos
 
 # ─── Santiment — Sentimiento social ──────────────────────────────────────────
 def get_santiment_sentiment(symbol):
@@ -107,6 +109,122 @@ def get_santiment_sentiment(symbol):
     except Exception as e:
         logger.error(f"Error Santiment {symbol}: {e}")
         return None
+
+
+# ─── CryptoQuant — Flujos on-chain y presión de ballenas ─────────────────────
+def get_cryptoquant_signal(symbol):
+    """
+    Obtiene señal de flujos on-chain de CryptoQuant.
+    Retorna señal de compra/venta basada en flujos a exchanges.
+    """
+    # Solo disponible para BTC y ETH en plan gratuito
+    asset_map = {"BTCUSDT": "btc", "ETHUSDT": "eth"}
+    asset = asset_map.get(symbol)
+    if not asset or not CRYPTOQUANT_KEY:
+        return None
+
+    now = time.time()
+    if symbol in cryptoquant_cache:
+        data, ts = cryptoquant_cache[symbol]
+        if now - ts < CRYPTOQUANT_TTL:
+            return data
+
+    try:
+        # Flujo neto hacia exchanges — si es positivo = presión de venta
+        resp = req_lib.get(
+            f"https://api.cryptoquant.com/v1/{asset}/exchange-flows/netflow",
+            headers={"Authorization": f"Bearer {CRYPTOQUANT_KEY}"},
+            params={"window": "hour", "limit": 6},
+            timeout=8
+        )
+        if resp.status_code != 200:
+            return None
+
+        data_points = resp.json().get("result", {}).get("data", [])
+        if not data_points:
+            return None
+
+        # Promedio de últimas 6 horas
+        netflows = [p.get("netflow_total", 0) for p in data_points]
+        avg_netflow = sum(netflows) / len(netflows) if netflows else 0
+
+        # Netflow positivo = dinero entrando a exchanges = presión de venta
+        # Netflow negativo = dinero saliendo de exchanges = acumulación (alcista)
+        bullish = avg_netflow < 0
+        bearish = avg_netflow > 0
+
+        result = {
+            "asset":      asset,
+            "avg_netflow": round(avg_netflow, 2),
+            "bullish":    bullish,
+            "bearish":    bearish,
+            "signal":     "comprar" if bullish else "vender" if bearish else "neutral",
+        }
+        cryptoquant_cache[symbol] = (result, now)
+        return result
+
+    except Exception as e:
+        logger.error(f"Error CryptoQuant {symbol}: {e}")
+        return None
+
+
+# ─── OpenAI — Análisis de noticias con GPT ───────────────────────────────────
+_openai_market_signal = {"signal": "neutral", "reason": "Sin datos", "ts": 0}
+
+def update_openai_signal():
+    """
+    Analiza el sentimiento general del mercado cripto con GPT-4.
+    Se ejecuta cada 10 minutos en background.
+    """
+    global _openai_market_signal
+    if not OPENAI_KEY:
+        return
+
+    now = time.time()
+    if now - _openai_market_signal.get("ts", 0) < OPENAI_TTL:
+        return
+
+    try:
+        resp = req_lib.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {OPENAI_KEY}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "model": "gpt-4o-mini",
+                "max_tokens": 100,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "Eres un analista de mercados cripto. Responde SOLO con JSON: {\"signal\": \"buy\"|\"sell\"|\"neutral\", \"reason\": \"explicación en 10 palabras\", \"confidence\": 0-100}"
+                    },
+                    {
+                        "role": "user",
+                        "content": f"Analiza el sentimiento actual del mercado cripto en {time.strftime('%Y-%m-%d %H:%M UTC')}. ¿Es buen momento para comprar?"
+                    }
+                ]
+            },
+            timeout=10
+        )
+        if resp.status_code != 200:
+            return
+
+        content = resp.json()["choices"][0]["message"]["content"]
+        # Limpiar posibles backticks
+        content = content.replace("```json", "").replace("```", "").strip()
+        parsed  = json.loads(content)
+        parsed["ts"] = now
+        _openai_market_signal = parsed
+        logger.info(f"🤖 OpenAI signal: {parsed['signal']} — {parsed.get('reason','')}")
+
+    except Exception as e:
+        logger.error(f"Error OpenAI: {e}")
+
+def get_openai_signal():
+    """Retorna la última señal de OpenAI."""
+    update_openai_signal()
+    return _openai_market_signal
 
 def get_taapi_signal(symbol):
     """
@@ -647,17 +765,33 @@ def bot_cycle():
                 if taapi_signal:
                     buy_score = taapi_signal.get("buy_score", 0)
                     if buy_score < 2:
-                        bot_log(f"🤖 ML rechaza compra {symbol} | score:{buy_score}/3 | RSI:{taapi_signal['rsi']} | BB:{taapi_signal['bb_pct']:.2f}", "info")
+                        bot_log(f"🤖 ML rechaza {symbol} | score:{buy_score}/3 | RSI:{taapi_signal['rsi']}", "info")
                         continue
-                    bot_log(f"🤖 ML aprueba compra {symbol} | score:{buy_score}/3 | RSI:{taapi_signal['rsi']} | MACD:{taapi_signal['macd_hist']:.6f}", "buy")
+                    bot_log(f"🤖 ML aprueba {symbol} | score:{buy_score}/3 | RSI:{taapi_signal['rsi']}", "buy")
 
                 # ── Verificación de sentimiento con Santiment ─────────────────
                 sentiment = get_santiment_sentiment(symbol)
                 if sentiment and sentiment["negative"]:
-                    bot_log(f"📉 Santiment rechaza {symbol} | sentimiento negativo: {sentiment['score']}", "info")
+                    bot_log(f"📉 Santiment rechaza {symbol} | score:{sentiment['score']}", "info")
                     continue
                 elif sentiment:
                     bot_log(f"📊 Santiment OK {symbol} | score:{sentiment['score']}", "buy")
+
+                # ── Verificación on-chain con CryptoQuant (solo BTC/ETH) ──────
+                cq_signal = get_cryptoquant_signal(symbol)
+                if cq_signal and cq_signal["bearish"]:
+                    bot_log(f"🐋 CryptoQuant rechaza {symbol} | flujo exchanges: {cq_signal['avg_netflow']:.0f}", "info")
+                    continue
+                elif cq_signal:
+                    bot_log(f"🐋 CryptoQuant OK {symbol} | {cq_signal['signal']} | netflow:{cq_signal['avg_netflow']:.0f}", "buy")
+
+                # ── Verificación de sentimiento general con OpenAI ────────────
+                ai_signal = get_openai_signal()
+                if ai_signal.get("signal") == "sell" and ai_signal.get("confidence", 0) > 70:
+                    bot_log(f"🧠 OpenAI rechaza compra | {ai_signal.get('reason','')}", "info")
+                    continue
+                elif ai_signal.get("signal") == "buy":
+                    bot_log(f"🧠 OpenAI aprueba | {ai_signal.get('reason','')} | conf:{ai_signal.get('confidence',0)}%", "buy")
 
                 # Primera entrada DCA: usa 40% del capital
                 first_amount = t_amount * 0.4
@@ -1213,13 +1347,20 @@ def clear_position():
 
 @app.route("/bot/ml_signals")
 def ml_signals():
-    """Retorna las señales ML actuales de Taapi para todos los pares."""
+    """Retorna todas las señales ML activas."""
     pairs = bot_state.get("pairs", []) + bot_state.get("volatile_pairs", [])
     signals = {}
     for sym in pairs:
-        cached = taapi_cache.get(sym)
-        if cached:
-            signals[sym] = cached[0]
+        entry = {}
+        if sym in taapi_cache:
+            entry["taapi"] = taapi_cache[sym][0]
+        if sym in santiment_cache:
+            entry["santiment"] = santiment_cache[sym][0]
+        if sym in cryptoquant_cache:
+            entry["cryptoquant"] = cryptoquant_cache[sym][0]
+        if entry:
+            signals[sym] = entry
+    signals["openai"] = _openai_market_signal
     return jsonify(signals)
 
 
