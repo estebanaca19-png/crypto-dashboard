@@ -136,8 +136,28 @@ bot_state = {
     ],
     # ── Reinversión automática ────────────────────────────────────────────────
     "reinvest_enabled": True,
-    "reinvest_pct": 80,  # reinvierte el 80% de cada ganancia, 20% queda como reserva
+    "reinvest_pct": 80,
     "total_reinvested": 0.0,
+    # ── Techo de inversión por moneda ─────────────────────────────────────────
+    "max_investment": {
+        "BTCUSDT":   100,
+        "ETHUSDT":   100,
+        "BNBUSDT":    60,
+        "SOLUSDT":    60,
+        "XRPUSDT":    60,
+        "ADAUSDT":    40,
+        "MATICUSDT":  40,
+        "DOTUSDT":    40,
+        "AVAXUSDT":   40,
+        "LINKUSDT":   40,
+        "LTCUSDT":    40,
+        "DOGEUSDT":   40,
+        "SHIBUSDT":   20,
+        "PEPEUSDT":   20,
+        "WIFUSDT":    20,
+        "BONKUSDT":   20,
+        "FLOKIUSDT":  20,
+    },
 }
 
 bot_thread    = None
@@ -188,6 +208,18 @@ def calc_qty(symbol, price, usdt_amount):
         return round(qty, 5)
     else:
         return round(qty, 2)
+
+
+def check_max_investment(symbol, additional_cost):
+    """Verifica si agregar más inversión supera el techo permitido."""
+    max_inv = bot_state.get("max_investment", {})
+    ceiling = max_inv.get(symbol, 50)  # por defecto $50
+    pos = bot_state.get("positions", {}).get(symbol)
+    current_cost = pos.get("cost", 0) if pos else 0
+    if current_cost + additional_cost > ceiling:
+        bot_log(f"⛔ Techo de inversión alcanzado para {symbol}: ${current_cost:.2f}/${ceiling} — no se compra más", "info")
+        return False
+    return True
 
 
 def get_rsi(closes, period=14):
@@ -438,8 +470,9 @@ def bot_cycle():
                 confirmed_drop and
                 rsi < (55 if high_vol else 50) and
                 n_positions < max_positions and
-                usdt_free >= t_amount * 0.4 and  # solo necesita 40% del trade para primera entrada
-                not daily_goal_reached()):
+                usdt_free >= t_amount * 0.4 and
+                not daily_goal_reached() and
+                check_max_investment(symbol, t_amount * 0.4)):
 
                 # Primera entrada DCA: usa 40% del capital
                 first_amount = t_amount * 0.4
@@ -489,7 +522,7 @@ def bot_cycle():
                     drop_from_avg = ((avg_price - price) / avg_price) * 100
                     dca_amount    = t_amount * level["amount_pct"]
 
-                    if drop_from_avg >= level["drop"] and usdt_free >= dca_amount:
+                    if drop_from_avg >= level["drop"] and usdt_free >= dca_amount and check_max_investment(symbol, dca_amount):
                         qty  = calc_qty(symbol, price, dca_amount)
                         step = get_step_size(client, symbol)
                         qty  = round_step(qty, step)
