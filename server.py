@@ -1885,6 +1885,366 @@ def bot_config():
     }})
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# MÓDULO DE FUTUROS — Estrategia Long/Short con ML
+# ═══════════════════════════════════════════════════════════════════════════════
+
+futures_state = {
+    "enabled":        False,
+    "positions":      {},      # {symbol: {side, entry, qty, leverage, sl, tp}}
+    "pairs":          ["ETHUSDT", "BTCUSDT"],
+    "leverage":       2,
+    "capital":        50.0,    # USDT por operación
+    "stop_loss":      1.5,     # %
+    "take_profit":    2.0,     # %
+    "min_score":      60,      # score mínimo para operar
+    "stats": {
+        "trades": 0, "wins": 0, "losses": 0,
+        "total_pnl": 0.0, "daily_pnl": 0.0,
+    },
+    "log": [],
+}
+futures_thread = None
+futures_lock   = threading.Lock()
+
+
+def futures_log(msg, level="info"):
+    entry = {"time": time.strftime("%H:%M:%S"), "msg": msg, "level": level}
+    with futures_lock:
+        futures_state["log"].append(entry)
+        if len(futures_state["log"]) > 100:
+            futures_state["log"] = futures_state["log"][-100:]
+    logger.info(f"[FUTURES] {msg}")
+
+
+def get_futures_client():
+    """Retorna cliente de Binance Futures."""
+    from binance.client import Client
+    return Client(API_KEY, SECRET_KEY)
+
+
+def get_futures_score(symbol, direction="long"):
+    """
+    Calcula el score ML para abrir una posición de futuros.
+    direction: 'long' o 'short'
+    Retorna (score, reasons, vetoes)
+    """
+    score   = 0
+    reasons = []
+    vetoes  = []
+    mult    = 1 if direction == "long" else -1
+
+    # ── 1. RSI Taapi (±30 pts) ────────────────────────────────────────────────
+    taapi = get_taapi_signal(symbol)
+    if taapi and taapi.get("ok"):
+        rsi = taapi.get("rsi", 50)
+        if rsi < 25:
+            pts = 30 * mult * -1  # RSI bajo = señal de long, no short
+            score += 30 if direction == "long" else -30
+            reasons.append(f"RSI:{rsi}(sobreventa extrema)")
+        elif rsi < 35:
+            score += 20 if direction == "long" else -20
+            reasons.append(f"RSI:{rsi}(sobreventa)")
+        elif rsi > 75:
+            score += -20 if direction == "long" else 20
+            reasons.append(f"RSI:{rsi}(sobrecompra extrema)")
+        elif rsi > 65:
+            score += -10 if direction == "long" else 10
+            reasons.append(f"RSI:{rsi}(sobrecompra)")
+        # MACD
+        macd = taapi.get("macd_hist", 0)
+        if macd > 0:
+            score += 15 if direction == "long" else -15
+            reasons.append("MACD:alcista")
+        else:
+            score += -15 if direction == "long" else 15
+            reasons.append("MACD:bajista")
+        # Bollinger
+        bb_pct = taapi.get("bb_pct", 0.5)
+        if bb_pct < 0.2:
+            score += 15 if direction == "long" else -15
+            reasons.append("BB:precio_bajo(soporte)")
+        elif bb_pct > 0.8:
+            score += -15 if direction == "long" else 15
+            reasons.append("BB:precio_alto(resistencia)")
+
+    # ── 2. Fear & Greed (±20 pts) ─────────────────────────────────────────────
+    fg = get_fear_greed()
+    fg_val = fg.get("value", 50)
+    if fg.get("extreme_fear"):
+        score += 20 if direction == "long" else -20
+        reasons.append(f"F&G:{fg_val}(miedo_extremo)")
+    elif fg.get("fear"):
+        score += 10 if direction == "long" else -10
+        reasons.append(f"F&G:{fg_val}(miedo)")
+    elif fg.get("extreme_greed"):
+        score += -20 if direction == "long" else 20
+        reasons.append(f"F&G:{fg_val}(euforia_extrema)")
+    elif fg.get("greed"):
+        score += -10 if direction == "long" else 10
+        reasons.append(f"F&G:{fg_val}(codicia)")
+
+    # ── 3. Santiment (±10 pts) ────────────────────────────────────────────────
+    sent = get_santiment_sentiment(symbol)
+    if sent:
+        if sent["positive"]:
+            score += 10 if direction == "long" else -10
+            reasons.append("Sentimiento:positivo")
+        elif sent["negative"]:
+            score += -10 if direction == "long" else 10
+            reasons.append("Sentimiento:negativo")
+
+    # ── 4. CryptoQuant (±15 pts, solo BTC/ETH) ───────────────────────────────
+    cq = get_cryptoquant_signal(symbol)
+    if cq:
+        if cq["bullish"]:
+            score += 15 if direction == "long" else -15
+            reasons.append("CryptoQuant:bullish")
+        elif cq["bearish"]:
+            score += -15 if direction == "long" else 15
+            reasons.append("CryptoQuant:bearish")
+
+    # ── 5. OpenAI (±10 pts) ───────────────────────────────────────────────────
+    ai = get_openai_signal()
+    if ai.get("signal") == "buy":
+        score += 10 if direction == "long" else -10
+        reasons.append(f"OpenAI:buy({ai.get('confidence',0)}%)")
+    elif ai.get("signal") == "sell":
+        score += -10 if direction == "long" else 10
+        reasons.append(f"OpenAI:sell({ai.get('confidence',0)}%)")
+
+    # ── Vetoes ────────────────────────────────────────────────────────────────
+    # No operar si ya hay posición abierta en el mismo símbolo
+    if symbol in futures_state["positions"]:
+        vetoes.append(f"Posición ya abierta en {symbol}")
+
+    # No operar en ambas direcciones simultáneamente
+    existing = futures_state["positions"].get(symbol, {})
+    if existing.get("side") == ("BUY" if direction == "short" else "SELL"):
+        vetoes.append("Dirección opuesta a posición existente")
+
+    return score, reasons, vetoes
+
+
+def futures_cycle():
+    """Ciclo principal de trading de futuros."""
+    try:
+        client = get_futures_client()
+
+        for symbol in futures_state["pairs"]:
+            try:
+                # Obtener precio actual
+                ticker = client.futures_symbol_ticker(symbol=symbol)
+                price  = float(ticker["price"])
+                hour   = time.gmtime().tm_hour
+
+                # Solo operar en horario activo 13-21 UTC
+                if not (13 <= hour <= 21):
+                    continue
+
+                # ── Gestión de posición existente ────────────────────────────
+                pos = futures_state["positions"].get(symbol)
+                if pos:
+                    entry    = pos["entry"]
+                    side     = pos["side"]  # BUY=long, SELL=short
+                    qty      = pos["qty"]
+                    sl_pct   = futures_state["stop_loss"] / 100
+                    tp_pct   = futures_state["take_profit"] / 100
+                    leverage = pos.get("leverage", 2)
+
+                    if side == "BUY":
+                        pnl_pct = (price - entry) / entry
+                    else:
+                        pnl_pct = (entry - price) / entry
+
+                    pnl_usdt = pnl_pct * entry * qty * leverage
+
+                    # Take Profit
+                    if pnl_pct >= tp_pct:
+                        try:
+                            close_side = "SELL" if side == "BUY" else "BUY"
+                            client.futures_create_order(
+                                symbol=symbol, side=close_side,
+                                type="MARKET", quantity=qty,
+                                reduceOnly=True
+                            )
+                            with futures_lock:
+                                del futures_state["positions"][symbol]
+                                futures_state["stats"]["total_pnl"] += pnl_usdt
+                                futures_state["stats"]["daily_pnl"]  += pnl_usdt
+                                futures_state["stats"]["trades"]     += 1
+                                futures_state["stats"]["wins"]       += 1
+                            futures_log(f"✅ TAKE PROFIT {symbol} {'LONG' if side=='BUY' else 'SHORT'} @ ${price:.2f} | +${pnl_usdt:.2f} ({pnl_pct*100:.2f}%)", "sell")
+                        except Exception as e:
+                            futures_log(f"✗ Error cerrando {symbol}: {e}", "error")
+
+                    # Stop Loss
+                    elif pnl_pct <= -sl_pct:
+                        try:
+                            close_side = "SELL" if side == "BUY" else "BUY"
+                            client.futures_create_order(
+                                symbol=symbol, side=close_side,
+                                type="MARKET", quantity=qty,
+                                reduceOnly=True
+                            )
+                            with futures_lock:
+                                del futures_state["positions"][symbol]
+                                futures_state["stats"]["total_pnl"] += pnl_usdt
+                                futures_state["stats"]["daily_pnl"]  += pnl_usdt
+                                futures_state["stats"]["trades"]     += 1
+                                futures_state["stats"]["losses"]     += 1
+                            futures_log(f"🛑 STOP LOSS {symbol} {'LONG' if side=='BUY' else 'SHORT'} @ ${price:.2f} | ${pnl_usdt:.2f} ({pnl_pct*100:.2f}%)", "error")
+                        except Exception as e:
+                            futures_log(f"✗ Error stop loss {symbol}: {e}", "error")
+                    else:
+                        futures_log(f"◷ {'LONG' if side=='BUY' else 'SHORT'} {symbol} @ ${price:.2f} | P&L:{pnl_pct*100:.2f}% (${pnl_usdt:.2f})", "info")
+                    continue
+
+                # ── Evaluación de nueva posición ──────────────────────────────
+                min_score = futures_state["min_score"]
+
+                # Score para LONG
+                long_score, long_reasons, long_vetoes = get_futures_score(symbol, "long")
+                # Score para SHORT
+                short_score, short_reasons, short_vetoes = get_futures_score(symbol, "short")
+
+                direction = None
+                score     = 0
+                reasons   = []
+
+                if long_score >= min_score and not long_vetoes and long_score > short_score:
+                    direction = "long"
+                    score     = long_score
+                    reasons   = long_reasons
+                elif short_score >= min_score and not short_vetoes and short_score > long_score:
+                    direction = "short"
+                    score     = short_score
+                    reasons   = short_reasons
+
+                if not direction:
+                    futures_log(f"⏸ {symbol} | LONG:{long_score} SHORT:{short_score} | sin señal clara", "info")
+                    continue
+
+                # ── Ejecutar orden ────────────────────────────────────────────
+                capital   = futures_state["capital"]
+                leverage  = futures_state["leverage"]
+
+                # Configurar apalancamiento
+                try:
+                    client.futures_change_leverage(symbol=symbol, leverage=leverage)
+                except:
+                    pass
+
+                # Calcular cantidad
+                notional = capital * leverage
+                qty      = round(notional / price, 3)
+                side     = "BUY" if direction == "long" else "SELL"
+
+                futures_log(f"🎯 SEÑAL {direction.upper()} {symbol} | score:{score} | {' · '.join(reasons[:3])}", "buy" if direction == "long" else "sell")
+
+                order = client.futures_create_order(
+                    symbol=symbol, side=side,
+                    type="MARKET", quantity=qty
+                )
+                fill_price = float(order.get("avgPrice", price))
+
+                with futures_lock:
+                    futures_state["positions"][symbol] = {
+                        "side":     side,
+                        "entry":    fill_price,
+                        "qty":      qty,
+                        "leverage": leverage,
+                        "time":     time.time(),
+                        "score":    score,
+                    }
+
+                futures_log(f"▲ ABIERTO {direction.upper()} {symbol} @ ${fill_price:.2f} | qty:{qty} | 2x | SL:{futures_state['stop_loss']}% TP:{futures_state['take_profit']}%", "buy" if direction == "long" else "sell")
+
+            except Exception as e:
+                futures_log(f"✗ Error futures {symbol}: {e}", "error")
+
+    except Exception as e:
+        futures_log(f"✗ Error general futures: {e}", "error")
+
+
+def futures_loop():
+    futures_log("🚀 Bot de futuros iniciado.", "info")
+    while futures_state["enabled"]:
+        try:
+            futures_cycle()
+        except Exception as e:
+            futures_log(f"✗ Error loop futures: {e}", "error")
+        time.sleep(45)
+    futures_log("⏹ Bot de futuros detenido.", "info")
+
+
+# ─── Endpoints de futuros ─────────────────────────────────────────────────────
+@app.route("/futures/start", methods=["POST"])
+def futures_start():
+    global futures_thread
+    data = request.get_json(silent=True) or {}
+    if futures_state["enabled"]:
+        return jsonify({"ok": False, "msg": "Futuros ya corriendo"})
+    if "capital"      in data: futures_state["capital"]      = float(data["capital"])
+    if "leverage"     in data: futures_state["leverage"]     = int(data["leverage"])
+    if "stop_loss"    in data: futures_state["stop_loss"]    = float(data["stop_loss"])
+    if "take_profit"  in data: futures_state["take_profit"]  = float(data["take_profit"])
+    if "min_score"    in data: futures_state["min_score"]    = int(data["min_score"])
+    if "pairs"        in data: futures_state["pairs"]        = data["pairs"]
+    futures_state["enabled"] = True
+    futures_thread = threading.Thread(target=futures_loop, daemon=True)
+    futures_thread.start()
+    return jsonify({"ok": True, "msg": "Bot de futuros iniciado"})
+
+
+@app.route("/futures/stop", methods=["POST"])
+def futures_stop():
+    futures_state["enabled"] = False
+    return jsonify({"ok": True, "msg": "Bot de futuros deteniendo..."})
+
+
+@app.route("/futures/status")
+def futures_status():
+    return jsonify({
+        "enabled":    futures_state["enabled"],
+        "positions":  futures_state["positions"],
+        "pairs":      futures_state["pairs"],
+        "capital":    futures_state["capital"],
+        "leverage":   futures_state["leverage"],
+        "stop_loss":  futures_state["stop_loss"],
+        "take_profit": futures_state["take_profit"],
+        "min_score":  futures_state["min_score"],
+        "stats":      futures_state["stats"],
+        "log":        futures_state["log"][-50:],
+    })
+
+
+@app.route("/futures/close", methods=["POST"])
+def futures_close():
+    """Cierra una posición de futuros manualmente."""
+    data   = request.get_json(silent=True) or {}
+    symbol = data.get("symbol")
+    if not symbol or symbol not in futures_state["positions"]:
+        return jsonify({"ok": False, "msg": "Posición no encontrada"})
+    try:
+        client = get_futures_client()
+        pos    = futures_state["positions"][symbol]
+        ticker = client.futures_symbol_ticker(symbol=symbol)
+        price  = float(ticker["price"])
+        close_side = "SELL" if pos["side"] == "BUY" else "BUY"
+        client.futures_create_order(
+            symbol=symbol, side=close_side,
+            type="MARKET", quantity=pos["qty"],
+            reduceOnly=True
+        )
+        with futures_lock:
+            del futures_state["positions"][symbol]
+        futures_log(f"🔒 Posición {symbol} cerrada manualmente @ ${price:.2f}", "info")
+        return jsonify({"ok": True, "msg": f"{symbol} cerrada"})
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)})
+
+
 # ─── Auto-arranque al cargar el módulo (compatible con gunicorn) ──────────────
 def _auto_start():
     global bot_thread, _bot_started
