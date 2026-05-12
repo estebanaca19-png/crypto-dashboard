@@ -745,15 +745,39 @@ def bot_loop():
 
 
 def _is_primary_worker():
-    """Verifica si este worker es el primario usando PostgreSQL."""
+    """Usa PostgreSQL para elegir un solo worker primario."""
     try:
+        import os
+        worker_id = str(os.getpid())
         conn = get_db()
-        rows = conn.run("SELECT pg_try_advisory_lock(99999)")
-        result = rows[0][0] if rows else False
+        # Crear tabla si no existe
+        conn.run("""
+            CREATE TABLE IF NOT EXISTS bot_worker (
+                id TEXT PRIMARY KEY,
+                pid TEXT NOT NULL,
+                ts BIGINT NOT NULL
+            )
+        """)
+        now = int(time.time())
+        # Intentar insertar o actualizar solo si han pasado más de 60 segundos
+        # sin que otro worker actualice (significa que el otro murió)
+        conn.run("""
+            INSERT INTO bot_worker (id, pid, ts) VALUES ('primary', :pid, :ts)
+            ON CONFLICT (id) DO UPDATE SET pid = :pid, ts = :ts
+            WHERE bot_worker.ts < :old_ts
+        """, pid=worker_id, ts=now, old_ts=now-60)
+        # Verificar si somos el worker registrado
+        rows = conn.run("SELECT pid FROM bot_worker WHERE id = 'primary'")
         conn.close()
-        return result
-    except:
-        return True  # si falla, asume que es primario
+        is_primary = rows[0][0] == worker_id if rows else False
+        if is_primary:
+            logger.info(f"Worker primario: PID {worker_id}")
+        else:
+            logger.info(f"Worker secundario PID {worker_id} — bot no arrancado")
+        return is_primary
+    except Exception as e:
+        logger.error(f"Error worker check: {e}")
+        return True
 
 
 # ─── Endpoints existentes ─────────────────────────────────────────────────────
