@@ -1072,14 +1072,20 @@ def bot_config():
 # ─── Auto-arranque al cargar el módulo (compatible con gunicorn) ──────────────
 def _auto_start():
     global bot_thread, _bot_started
-    import fcntl
-    lock_file = open("/tmp/bot.lock", "w")
-    try:
-        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except IOError:
-        logger.info("Bot ya está corriendo en otro worker. Saltando auto-start.")
-        return
     if _bot_started:
+        return
+    # Usar PostgreSQL advisory lock para garantizar una sola instancia
+    try:
+        conn = get_db()
+        # pg_try_advisory_lock retorna true solo si obtiene el lock
+        rows = conn.run("SELECT pg_try_advisory_lock(12345)")
+        got_lock = rows[0][0] if rows else False
+        conn.close()
+        if not got_lock:
+            logger.info("Bot ya corriendo en otro worker. Saltando.")
+            return
+    except Exception as e:
+        logger.error(f"Error advisory lock: {e}")
         return
     _bot_started = True
     init_db()
