@@ -1009,40 +1009,39 @@ def bot_start():
 
 @app.route("/bot/stop", methods=["POST"])
 def bot_stop():
-    with bot_lock:
-        if not bot_state["running"]:
-            return jsonify({"ok": False, "msg": "Bot no está corriendo"}), 400
-        bot_state["running"] = False
+    if not bot_state["running"]:
+        return jsonify({"ok": False, "msg": "Bot no está corriendo"}), 400
+    bot_state["running"] = False
     return jsonify({"ok": True, "msg": "Bot deteniendo..."})
 
 
 @app.route("/bot/status")
 def bot_status():
-    with bot_lock:
-        return jsonify({
-            "running":            bot_state["running"],
-            "pairs":              bot_state["pairs"],
-            "volatile_pairs":     bot_state["volatile_pairs"],
-            "profit_target":      bot_state["profit_target"],
-            "volatile_profit":    bot_state["volatile_profit"],
-            "drop_to_buy":        bot_state["drop_to_buy"],
-            "trade_amount":       bot_state["trade_amount"],
-            "volatile_amount":    bot_state["volatile_amount"],
-            "interval":           bot_state["interval"],
-            "positions":          bot_state["positions"],
-            "stats":              bot_state["stats"],
-            "last_prices":        bot_state["last_prices"],
-            "last_changes":       bot_state["last_changes"],
-            "usdt_available":     bot_state["usdt_available"],
-            "max_positions":      bot_state["max_positions"],
-            "stop_loss":          bot_state["stop_loss"],
-            "volatile_stop_loss": bot_state["volatile_stop_loss"],
-            "blacklist":          {k: round(v - time.time()) for k, v in bot_state["blacklist"].items() if v > time.time()},
-            "total_reinvested":   bot_state.get("total_reinvested", 0),
-            "dca_enabled":        bot_state.get("dca_enabled", True),
-            "reinvest_enabled":   bot_state.get("reinvest_enabled", True),
-            "log":                bot_state["log"][-50:],
-        })
+    # Lectura directa sin lock para evitar deadlock con bot_cycle
+    return jsonify({
+        "running":            bot_state["running"],
+        "pairs":              bot_state.get("pairs", []),
+        "volatile_pairs":     bot_state.get("volatile_pairs", []),
+        "profit_target":      bot_state.get("profit_target", 0.8),
+        "volatile_profit":    bot_state.get("volatile_profit", 1.5),
+        "drop_to_buy":        bot_state.get("drop_to_buy", 0.15),
+        "trade_amount":       bot_state.get("trade_amount", 50),
+        "volatile_amount":    bot_state.get("volatile_amount", 20),
+        "interval":           bot_state.get("interval", 20),
+        "positions":          dict(bot_state.get("positions", {})),
+        "stats":              dict(bot_state.get("stats", {})),
+        "last_prices":        dict(bot_state.get("last_prices", {})),
+        "last_changes":       dict(bot_state.get("last_changes", {})),
+        "usdt_available":     bot_state.get("usdt_available", 0),
+        "max_positions":      bot_state.get("max_positions", 8),
+        "stop_loss":          bot_state.get("stop_loss", 3.0),
+        "volatile_stop_loss": bot_state.get("volatile_stop_loss", 2.0),
+        "blacklist":          {k: round(v - time.time()) for k, v in bot_state.get("blacklist", {}).items() if v > time.time()},
+        "total_reinvested":   bot_state.get("total_reinvested", 0),
+        "dca_enabled":        bot_state.get("dca_enabled", True),
+        "reinvest_enabled":   bot_state.get("reinvest_enabled", True),
+        "log":                bot_state.get("log", [])[-50:],
+    })
 
 
 @app.route("/bot/config", methods=["POST"])
