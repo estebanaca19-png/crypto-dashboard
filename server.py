@@ -778,15 +778,16 @@ def get_market_context(client, all_pairs):
         btc_change_24h = float(btc_ticker["priceChangePercent"])
         btc_price = float(btc_ticker["lastPrice"])
 
-        # 2. Calcular cuántos pares están cayendo vs subiendo
+        # 2. Calcular cuántos pares están cayendo vs subiendo en 24h
         falling = 0
         rising  = 0
-        for sym in all_pairs[:8]:  # muestra representativa
+        for sym in all_pairs[:8]:
             try:
                 t = client.get_ticker(symbol=sym)
                 chg = float(t["priceChangePercent"])
-                if chg < -1: falling += 1
-                elif chg > 1: rising += 1
+                if chg < -1:   falling += 1
+                elif chg > 1:  rising  += 1
+                else:          rising  += 1  # neutral cuenta como no cayendo
             except:
                 pass
 
