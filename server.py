@@ -27,7 +27,7 @@ openai_cache      = {}
 TAAPI_TTL         = 30    # segundos
 SANTIMENT_TTL     = 300   # 5 minutos
 CRYPTOQUANT_TTL   = 300   # 5 minutos
-OPENAI_TTL        = 600   # 10 minutos
+OPENAI_TTL        = 1800   # 30 minutos
 
 # ─── Santiment — Sentimiento social ──────────────────────────────────────────
 def get_santiment_sentiment(symbol):
@@ -173,11 +173,16 @@ _openai_market_signal = {"signal": "neutral", "reason": "Sin datos", "ts": 0}
 
 def update_openai_signal():
     """
-    Analiza el sentimiento general del mercado cripto con GPT-4.
-    Se ejecuta cada 10 minutos en background.
+    Analiza el sentimiento general del mercado cripto con GPT.
+    Se ejecuta cada 2 horas solo en horario activo (8am-10pm UTC).
     """
     global _openai_market_signal
     if not OPENAI_KEY:
+        return
+
+    # Solo en horario activo
+    hour = time.gmtime().tm_hour
+    if not (8 <= hour <= 22):
         return
 
     now = time.time()
@@ -700,6 +705,9 @@ def bot_cycle():
         usdt_free = 0.0
 
     high_vol = is_high_volatility_hour()
+
+    # Actualizar señal OpenAI cada 10 minutos en background
+    threading.Thread(target=update_openai_signal, daemon=True).start()
 
     for symbol in all_pairs:
         try:
