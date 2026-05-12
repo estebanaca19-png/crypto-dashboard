@@ -2,7 +2,7 @@ from flask import Flask, jsonify, request
 from flask_cors import CORS
 from binance.client import Client
 from binance.enums import SIDE_BUY, SIDE_SELL, ORDER_TYPE_MARKET
-import os, time, threading, logging, json
+import os, time, threading, logging, json, requests as req_lib
 import pg8000.native as pg8000
 
 app = Flask(__name__)
@@ -11,9 +11,89 @@ CORS(app)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-API_KEY    = os.environ.get("API_KEY")
-SECRET_KEY = os.environ.get("SECRET_KEY")
+API_KEY      = os.environ.get("API_KEY")
+SECRET_KEY   = os.environ.get("SECRET_KEY")
 DATABASE_URL = os.environ.get("DATABASE_URL")
+TAAPI_SECRET = os.environ.get("TAAPI_SECRET", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJjbHVlIjoiNmEwMzM3YzllZTAzMzMxMWE0MGU5YWFhIiwiaWF0IjoxNzc4NTk1OTU4LCJleHAiOjMzMjgzMDU5OTU4fQ.kIS7jNksK2hpr7rHkOBRIB4T608qmVjk1ZA6mOvmY60")
+
+# ─── Cache de señales Taapi (evitar llamadas repetidas) ───────────────────────
+taapi_cache = {}
+TAAPI_TTL   = 30  # segundos de cache por símbolo
+
+def get_taapi_signal(symbol):
+    """
+    Obtiene señales ML de Taapi para un símbolo.
+    Retorna dict con rsi, macd_hist, bb_percent, señal general.
+    """
+    now = time.time()
+    if symbol in taapi_cache:
+        data, ts = taapi_cache[symbol]
+        if now - ts < TAAPI_TTL:
+            return data
+
+    # Convertir símbolo Binance a formato Taapi (BTCUSDT → BTC/USDT)
+    base = symbol.replace("USDT", "")
+    taapi_sym = f"{base}/USDT"
+
+    try:
+        # Llamada bulk — RSI + MACD + Bollinger en una sola petición
+        payload = {
+            "secret": TAAPI_SECRET,
+            "construct": {
+                "exchange": "binance",
+                "symbol": taapi_sym,
+                "interval": "5m",
+                "indicators": [
+                    {"id": "rsi",  "indicator": "rsi"},
+                    {"id": "macd", "indicator": "macd"},
+                    {"id": "bb",   "indicator": "bbands"},
+                    {"id": "ema20","indicator": "ema", "period": 20},
+                ]
+            }
+        }
+        resp = req_lib.post(
+            "https://api.taapi.io/bulk",
+            json=payload,
+            timeout=8
+        )
+        if resp.status_code != 200:
+            return None
+        results = resp.json().get("data", [])
+        parsed  = {r["id"]: r["result"] for r in results if "result" in r}
+
+        rsi       = parsed.get("rsi", {}).get("value", 50)
+        macd_hist = parsed.get("macd", {}).get("valueHist", 0)
+        bb        = parsed.get("bb", {})
+        bb_upper  = bb.get("valueUpperBand", 0)
+        bb_lower  = bb.get("valueLowerBand", 0)
+        bb_mid    = bb.get("valueMiddleBand", 0)
+        ema20     = parsed.get("ema20", {}).get("value", 0)
+
+        # Calcular bb_percent (qué tan cerca está del lower band, 0=lower, 1=upper)
+        bb_range   = bb_upper - bb_lower if bb_upper > bb_lower else 1
+        last_price = bb_mid  # aproximación
+        bb_pct     = (last_price - bb_lower) / bb_range if bb_range > 0 else 0.5
+
+        # Señal de compra: RSI bajo + MACD histograma subiendo + precio cerca del lower band
+        buy_score = 0
+        if rsi < 45:        buy_score += 1
+        if macd_hist > 0:   buy_score += 1  # histograma positivo = momentum alcista
+        if bb_pct < 0.35:   buy_score += 1  # precio cerca del lower band
+
+        signal = {
+            "rsi":       round(rsi, 1),
+            "macd_hist": round(macd_hist, 6),
+            "bb_pct":    round(bb_pct, 3),
+            "ema20":     round(ema20, 4),
+            "buy_score": buy_score,  # 0-3, necesitamos ≥2 para comprar
+            "ok":        True,
+        }
+        taapi_cache[symbol] = (signal, now)
+        return signal
+
+    except Exception as e:
+        logger.error(f"Error Taapi {symbol}: {e}")
+        return None
 
 # ─── PostgreSQL Persistencia ──────────────────────────────────────────────────
 def get_db():
@@ -473,6 +553,15 @@ def bot_cycle():
                 usdt_free >= t_amount * 0.4 and
                 not daily_goal_reached() and
                 check_max_investment(symbol, t_amount * 0.4)):
+
+                # ── Verificación ML con Taapi ────────────────────────────────
+                taapi_signal = get_taapi_signal(symbol)
+                if taapi_signal:
+                    buy_score = taapi_signal.get("buy_score", 0)
+                    if buy_score < 2:
+                        bot_log(f"🤖 ML rechaza compra {symbol} | score:{buy_score}/3 | RSI:{taapi_signal['rsi']} | BB:{taapi_signal['bb_pct']:.2f}", "info")
+                        continue
+                    bot_log(f"🤖 ML aprueba compra {symbol} | score:{buy_score}/3 | RSI:{taapi_signal['rsi']} | MACD:{taapi_signal['macd_hist']:.6f}", "buy")
 
                 # Primera entrada DCA: usa 40% del capital
                 first_amount = t_amount * 0.4
@@ -1025,6 +1114,18 @@ def clear_position():
         state_lock.release()
     save_state()
     return jsonify({"ok": True, "msg": f"Posición {symbol} eliminada"})
+
+@app.route("/bot/ml_signals")
+def ml_signals():
+    """Retorna las señales ML actuales de Taapi para todos los pares."""
+    pairs = bot_state.get("pairs", []) + bot_state.get("volatile_pairs", [])
+    signals = {}
+    for sym in pairs:
+        cached = taapi_cache.get(sym)
+        if cached:
+            signals[sym] = cached[0]
+    return jsonify(signals)
+
 
 @app.route("/bot/portfolio")
 def bot_portfolio():
