@@ -481,7 +481,8 @@ def bot_cycle():
 
                 dca_levels  = bot_state.get("dca_levels", [])
                 dca_entries = position.get("dca_entries", [])
-                n_entries   = len(dca_entries)                avg_price   = position.get("avg_price", position["buy_price"])
+                n_entries   = len(dca_entries)
+                avg_price   = position.get("avg_price", position["buy_price"])
 
                 if n_entries < len(dca_levels):
                     level         = dca_levels[n_entries]
