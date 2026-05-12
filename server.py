@@ -14,11 +14,99 @@ logger = logging.getLogger(__name__)
 API_KEY      = os.environ.get("API_KEY")
 SECRET_KEY   = os.environ.get("SECRET_KEY")
 DATABASE_URL = os.environ.get("DATABASE_URL")
-TAAPI_SECRET = os.environ.get("TAAPI_SECRET", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJjbHVlIjoiNmEwMzM3YzllZTAzMzMxMWE0MGU5YWFhIiwiaWF0IjoxNzc4NTk1OTU4LCJleHAiOjMzMjgzMDU5OTU4fQ.kIS7jNksK2hpr7rHkOBRIB4T608qmVjk1ZA6mOvmY60")
+TAAPI_SECRET    = os.environ.get("TAAPI_SECRET", "")
+SANTIMENT_KEY   = os.environ.get("SANTIMENT_KEY", "")
+GLASSNODE_KEY   = os.environ.get("GLASSNODE_KEY", "")
+OPENAI_KEY      = os.environ.get("OPENAI_KEY", "")
 
-# ─── Cache de señales Taapi (evitar llamadas repetidas) ───────────────────────
-taapi_cache = {}
-TAAPI_TTL   = 30  # segundos de cache por símbolo
+# ─── Cache de señales externas ────────────────────────────────────────────────
+taapi_cache     = {}
+santiment_cache = {}
+glassnode_cache = {}
+TAAPI_TTL       = 30   # segundos
+SANTIMENT_TTL   = 300  # 5 minutos
+GLASSNODE_TTL   = 300  # 5 minutos
+
+# ─── Santiment — Sentimiento social ──────────────────────────────────────────
+def get_santiment_sentiment(symbol):
+    """
+    Obtiene sentimiento social de Santiment para una moneda.
+    Retorna score entre -1 (muy negativo) y 1 (muy positivo).
+    """
+    # Mapeo de símbolos Binance a slugs de Santiment
+    slug_map = {
+        "BTCUSDT": "bitcoin", "ETHUSDT": "ethereum", "BNBUSDT": "binance-coin",
+        "SOLUSDT": "solana", "XRPUSDT": "xrp", "ADAUSDT": "cardano",
+        "DOGEUSDT": "dogecoin", "DOTUSDT": "polkadot", "LINKUSDT": "chainlink",
+        "LTCUSDT": "litecoin", "AVAXUSDT": "avalanche", "MATICUSDT": "matic-network",
+        "SHIBUSDT": "shiba-inu", "PEPEUSDT": "pepe", "FLOKIUSDT": "floki",
+    }
+    slug = slug_map.get(symbol)
+    if not slug or not SANTIMENT_KEY:
+        return None
+
+    now = time.time()
+    if symbol in santiment_cache:
+        data, ts = santiment_cache[symbol]
+        if now - ts < SANTIMENT_TTL:
+            return data
+
+    try:
+        # Query GraphQL de Santiment para sentiment_balance
+        query = """
+        {
+          getMetric(metric: "sentiment_balance_total") {
+            timeseriesData(
+              slug: "%s"
+              from: "%s"
+              to: "%s"
+              interval: "1h"
+            ) {
+              datetime
+              value
+            }
+          }
+        }
+        """ % (slug,
+               time.strftime("%Y-%m-%dT%H:00:00Z", time.gmtime(now - 7200)),
+               time.strftime("%Y-%m-%dT%H:00:00Z", time.gmtime(now)))
+
+        resp = req_lib.post(
+            "https://api.santiment.net/graphql",
+            json={"query": query},
+            headers={"Authorization": f"Apikey {SANTIMENT_KEY}"},
+            timeout=8
+        )
+        if resp.status_code != 200:
+            return None
+
+        data_points = resp.json().get("data", {}).get("getMetric", {}).get("timeseriesData", [])
+        if not data_points:
+            return None
+
+        # Promedio de las últimas 2 horas
+        values = [p["value"] for p in data_points if p["value"] is not None]
+        if not values:
+            return None
+        avg_sentiment = sum(values) / len(values)
+
+        # Normalizar a -1 a 1
+        score = max(-1, min(1, avg_sentiment / 10))
+
+        result = {
+            "slug":      slug,
+            "score":     round(score, 3),
+            "raw":       round(avg_sentiment, 3),
+            "positive":  score > 0.1,
+            "negative":  score < -0.1,
+            "neutral":   -0.1 <= score <= 0.1,
+        }
+        santiment_cache[symbol] = (result, now)
+        return result
+
+    except Exception as e:
+        logger.error(f"Error Santiment {symbol}: {e}")
+        return None
 
 def get_taapi_signal(symbol):
     """
@@ -562,6 +650,14 @@ def bot_cycle():
                         bot_log(f"🤖 ML rechaza compra {symbol} | score:{buy_score}/3 | RSI:{taapi_signal['rsi']} | BB:{taapi_signal['bb_pct']:.2f}", "info")
                         continue
                     bot_log(f"🤖 ML aprueba compra {symbol} | score:{buy_score}/3 | RSI:{taapi_signal['rsi']} | MACD:{taapi_signal['macd_hist']:.6f}", "buy")
+
+                # ── Verificación de sentimiento con Santiment ─────────────────
+                sentiment = get_santiment_sentiment(symbol)
+                if sentiment and sentiment["negative"]:
+                    bot_log(f"📉 Santiment rechaza {symbol} | sentimiento negativo: {sentiment['score']}", "info")
+                    continue
+                elif sentiment:
+                    bot_log(f"📊 Santiment OK {symbol} | score:{sentiment['score']}", "buy")
 
                 # Primera entrada DCA: usa 40% del capital
                 first_amount = t_amount * 0.4
