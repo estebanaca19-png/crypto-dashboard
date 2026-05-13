@@ -1720,6 +1720,23 @@ def clear_position():
     save_state()
     return jsonify({"ok": True, "msg": f"Posición {symbol} eliminada"})
 
+@app.route("/bot/warmup_apis")
+def warmup_apis():
+    """Pre-carga todas las APIs en background para mantener el cache actualizado."""
+    def _warmup():
+        pairs = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"]
+        for sym in pairs:
+            get_taapi_signal(sym)
+            get_santiment_sentiment(sym)
+            get_cryptoquant_signal(sym)
+            get_coinglass_signal(sym)
+        get_fear_greed()
+        update_openai_signal()
+        logger.info("✅ APIs pre-cargadas correctamente")
+    threading.Thread(target=_warmup, daemon=True).start()
+    return jsonify({"ok": True, "msg": "Warmup iniciado en background"})
+
+
 @app.route("/bot/ml_signals")
 def ml_signals():
     """Retorna todas las señales ML activas."""
@@ -2254,7 +2271,23 @@ def futures_close():
 
 
 # ─── Auto-arranque al cargar el módulo (compatible con gunicorn) ──────────────
-def _auto_start():
+def preload_apis():
+    """Precarga todas las APIs cada 30 minutos para mantener cache actualizado."""
+    while True:
+        try:
+            logger.info("🔄 Precargando APIs en background...")
+            key_pairs = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"]
+            for sym in key_pairs:
+                threading.Thread(target=get_taapi_signal, args=(sym,), daemon=True).start()
+                threading.Thread(target=get_santiment_sentiment, args=(sym,), daemon=True).start()
+                threading.Thread(target=get_cryptoquant_signal, args=(sym,), daemon=True).start()
+                time.sleep(2)
+            get_fear_greed()
+            get_coinglass_signal("BTCUSDT")
+            update_openai_signal()
+        except Exception as e:
+            logger.error(f"Error precargando APIs: {e}")
+        time.sleep(1800)  # cada 30 minutos
     global bot_thread, _bot_started
     if _bot_started:
         return
@@ -2268,6 +2301,9 @@ def _auto_start():
     bot_thread = threading.Thread(target=bot_loop, daemon=True)
     bot_thread.start()
     logger.info("🚀 Bot spot arrancado automáticamente.")
+
+    # Precargar APIs en background
+    threading.Thread(target=preload_apis, daemon=True).start()
 
     # Auto-arranque de futuros si estaba activo
     if futures_state.get("auto_start", True):
