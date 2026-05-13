@@ -2272,18 +2272,14 @@ def futures_close():
 
 # ─── Auto-arranque al cargar el módulo (compatible con gunicorn) ──────────────
 def preload_apis():
-    """Precarga todas las APIs cada 30 minutos para mantener cache actualizado."""
+    """Precarga APIs con espacio entre llamadas para no bloquear."""
+    time.sleep(60)  # esperar 1 minuto antes de primera precarga
     while True:
         try:
             logger.info("🔄 Precargando APIs en background...")
-            key_pairs = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"]
-            for sym in key_pairs:
-                threading.Thread(target=get_taapi_signal, args=(sym,), daemon=True).start()
-                threading.Thread(target=get_santiment_sentiment, args=(sym,), daemon=True).start()
-                threading.Thread(target=get_cryptoquant_signal, args=(sym,), daemon=True).start()
-                time.sleep(2)
+            # Solo Fear & Greed y OpenAI — no bloquean
             get_fear_greed()
-            get_coinglass_signal("BTCUSDT")
+            time.sleep(5)
             update_openai_signal()
         except Exception as e:
             logger.error(f"Error precargando APIs: {e}")
