@@ -909,8 +909,16 @@ def bot_cycle():
     # Actualizar Fear & Greed cada hora en background
     threading.Thread(target=get_fear_greed, daemon=True).start()
 
-    # Obtener contexto general del mercado
-    market_ctx = get_market_context(client, all_pairs)
+    # Contexto de mercado deshabilitado temporalmente para evitar bloqueos
+    market_ctx = {
+        "btc_change_24h": 0,
+        "market_crash": False,
+        "market_weak": False,
+        "market_strong": False,
+        "broad_selloff": False,
+        "on_losing_streak": False,
+        "market_bearish_pct": 0,
+    }
 
     # Veto global — si el mercado está en crash, no comprar nada
     if market_ctx.get("market_crash"):
