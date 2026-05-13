@@ -377,7 +377,7 @@ def health_monitor():
             cycles = d.get("stats", {}).get("cycles", 0)
             if cycles == monitor_state["last_cycles"]:
                 elapsed = time.time() - monitor_state["last_cycle_time"]
-                if elapsed > 120:  # 2 minutos sin ciclos
+                if elapsed > 300:  # 5 minutos sin ciclos
                     send("⚠️ *ALERTA — Bot congelado*\nLos ciclos no avanzan. Reiniciando...")
                     subprocess.run(["systemctl", "restart", "cruztrd"], timeout=30)
                     monitor_state["last_cycle_time"] = time.time()
