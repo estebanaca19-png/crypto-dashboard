@@ -2288,6 +2288,9 @@ def preload_apis():
         except Exception as e:
             logger.error(f"Error precargando APIs: {e}")
         time.sleep(1800)  # cada 30 minutos
+
+
+def _auto_start():
     global bot_thread, _bot_started
     if _bot_started:
         return
